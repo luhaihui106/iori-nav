@@ -74,12 +74,17 @@ async function loadRawSession(env, sessionId) {
 
 function detectRequestMode(message) {
   const text = String(message || '').replace(/\s+/g, ' ');
-  const prepareChanges = /(生成|准备|列出|给出|给我).{0,24}(变更预览|待确认变更|可执行预览|操作预览)|预览.{0,12}(变更|修改)|生成.{0,16}actions?/i.test(text);
+  const explicitNoPreview = /(不要|不用|不需要|先别|暂不).{0,10}(生成|做|给出|给我)?{0,1}.{0,6}预览|不要预览/.test(text);
+  const analysisOnly = /(只给方案|先给方案|仅给方案|先不要修改|不要修改任何数据|不要修改数据|不修改数据|先别修改|仅分析|只分析|先分析|只做分析|不要生成可执行)/.test(text);
+
+  if (explicitNoPreview && analysisOnly) return 'analysis_only';
+
+  const mentionsPreview = /预览/.test(text);
+  const prepareChanges = mentionsPreview ||
+    /(生成|准备|列出|给出|给我).{0,30}(待确认变更|可执行变更|操作清单)|生成.{0,16}actions?/i.test(text);
   if (prepareChanges) return 'prepare_changes';
 
-  const analysisOnly = /(只给方案|先给方案|仅给方案|先不要修改|不要修改任何数据|不要修改数据|不修改数据|先别修改|仅分析|只分析|先分析|只做分析|不要生成可执行)/.test(text);
   if (analysisOnly) return 'analysis_only';
-
   return 'normal';
 }
 
@@ -167,6 +172,27 @@ function normalizeEstimatedText(value, actionCount) {
   return String(value || '').replace(/(预计(?:变更)?\s*[:：]?\s*(?:约\s*)?)\d+\s*项/g, `$1${actionCount} 项`);
 }
 
+function normalizeScopeRefs(scope, categoryMap, validationErrors) {
+  const refs = [];
+  const pattern = /分类\s*#?\s*(\d+)\s*[「『“"【]([^」』”"】]+)[」』”"】]/g;
+  const normalized = String(scope || '').replace(pattern, (full, rawId, claimedName) => {
+    const id = Number.parseInt(rawId, 10);
+    const claimed = String(claimedName || '').trim();
+    const actualName = categoryMap.get(id) || '';
+    refs.push({ id, claimedName: claimed, actualName });
+
+    if (!actualName) {
+      validationErrors.push(`覆盖范围引用不存在的分类 ID ${id}`);
+      return full;
+    }
+    if (actualName !== claimed) {
+      validationErrors.push(`分类 ${id} 名称不匹配：模型写“${claimed}”，数据库为“${actualName}”`);
+    }
+    return `分类${id}「${actualName}」`;
+  });
+  return { normalized, refs };
+}
+
 async function validatePreparedPreview(responseData, env) {
   if (!responseData?.data || responseData.data.mode !== 'prepare_changes' || !env.NAV_DB) return responseData;
 
@@ -176,27 +202,17 @@ async function validatePreparedPreview(responseData, env) {
   const { results } = await env.NAV_DB.prepare('SELECT id, catelog FROM category ORDER BY id').all();
   const categoryMap = new Map((results || []).map(row => [Number(row.id), String(row.catelog || '')]));
   const validationErrors = [];
-  const planScopeRefs = [];
+  let planScopeRefs = [];
 
   if (data.plan && typeof data.plan === 'object') {
-    const rawScope = String(data.plan.scope || '');
-    data.plan.scope = rawScope.replace(/分类\s*#?\s*(\d+)\s*[「“"]([^」”"]+)[」”"]/g, (full, rawId, claimedName) => {
-      const id = Number.parseInt(rawId, 10);
-      const actualName = categoryMap.get(id);
-      planScopeRefs.push({ id, claimedName: String(claimedName || '').trim(), actualName: actualName || '' });
-      if (!actualName) {
-        validationErrors.push(`覆盖范围引用不存在的分类 ID ${id}`);
-        return full;
-      }
-      if (actualName !== String(claimedName || '').trim()) {
-        validationErrors.push(`分类 ${id} 名称不匹配：模型写“${claimedName}”，数据库为“${actualName}”`);
-        return `分类${id}「${actualName}」`;
-      }
-      return `分类${id}「${actualName}」`;
-    });
+    const scope = normalizeScopeRefs(data.plan.scope, categoryMap, validationErrors);
+    data.plan.scope = scope.normalized;
+    planScopeRefs = scope.refs;
   }
 
-  const singleScopeId = planScopeRefs.length === 1 && planScopeRefs[0].actualName ? planScopeRefs[0].id : 0;
+  const validScopeRefs = planScopeRefs.filter(item => item.actualName && item.actualName === item.claimedName);
+  const singleScopeId = validScopeRefs.length === 1 ? validScopeRefs[0].id : 0;
+
   for (const action of data.actions) {
     if (action?.type === 'create_category') {
       const parentId = Number.parseInt(action.parentId, 10) || 0;
@@ -236,7 +252,7 @@ async function validatePreparedPreview(responseData, env) {
   if (data.prepareValidationBlocked) {
     data.actions = [];
     if (data.plan && typeof data.plan === 'object') data.plan.estimatedChanges = 0;
-    data.reply = `变更预览已被安全校验拦截，当前为 0 项可执行变更。${data.prepareValidationErrors.join('；')}。系统不会显示确认执行，请重新读取分类映射后生成预览。`;
+    data.reply = `变更预览已被安全校验拦截，当前为 0 项可执行变更。${data.prepareValidationErrors.join('；')}。系统不会显示确认执行，并将自动尝试重新读取分类映射后生成预览。`;
   }
 
   return responseData;
@@ -252,20 +268,47 @@ function ensureTruthfulPrepareResponse(responseData) {
 
   responseData.data.prepareChangesEmpty = true;
   const reply = String(responseData.data.reply || '');
-  const explicitlyZero = /(0\s*项|零项|没有任何|无需修改|没有需要修改|无有效变更|没有有效变更)/.test(reply);
+  const explicitlyZero = /(0\s*项|零项|没有任何|无需修改|没有需要修改|无有效变更|没有有效变更|安全校验拦截)/.test(reply);
   if (!explicitlyZero) {
-    responseData.data.reply = '未能生成可执行变更预览：本轮 prepare_changes 返回 0 项有效 actions。系统没有把自然语言声明当作已生成的预览。请重新读取目标范围后再试，或明确指定要移动、重命名或修改描述的书签。';
+    responseData.data.reply = '未能生成可执行变更预览：本轮 prepare_changes 最终返回 0 项有效 actions。系统没有把自然语言声明当作已生成的预览，也不会显示确认执行。请重新读取目标范围后再试，或明确指定要移动、重命名或修改描述的书签。';
   }
   return responseData;
 }
 
+function snapshotPrepareAttempt(responseData, attempt) {
+  const data = responseData?.data || {};
+  return {
+    attempt,
+    actionCount: Array.isArray(data.actions) ? data.actions.length : 0,
+    blocked: Boolean(data.prepareValidationBlocked),
+    errors: Array.isArray(data.prepareValidationErrors) ? data.prepareValidationErrors.slice(0, 8) : [],
+  };
+}
+
 function appendPrepareAudit(responseData, attempts, retryUsed) {
   if (!responseData?.data || responseData.data.mode !== 'prepare_changes') return;
-  const actions = Array.isArray(responseData.data.actions) ? responseData.data.actions : [];
-  const toolsUsed = Array.isArray(responseData.data.toolsUsed) ? responseData.data.toolsUsed : [];
-  toolsUsed.push(`prepare 校验：attempt=${attempts}；retry=${retryUsed ? 'yes' : 'no'}；actionCount=${actions.length}；blocked=${responseData.data.prepareValidationBlocked ? 'yes' : 'no'}`);
-  responseData.data.toolsUsed = toolsUsed;
-  responseData.data.prepareAttempt = attempts;
+  const data = responseData.data;
+  const actions = Array.isArray(data.actions) ? data.actions : [];
+  const toolsUsed = Array.isArray(data.toolsUsed) ? [...data.toolsUsed] : [];
+
+  for (const item of attempts) {
+    const errors = item.errors.length ? `；errors=${item.errors.join(' | ')}` : '';
+    toolsUsed.push(`prepare 第${item.attempt}次校验：actionCount=${item.actionCount}；blocked=${item.blocked ? 'yes' : 'no'}${errors}`);
+  }
+
+  const everBlocked = attempts.some(item => item.blocked);
+  toolsUsed.push(`prepare 最终：attempt=${attempts.length || 1}；retry=${retryUsed ? 'yes' : 'no'}；actionCount=${actions.length}；blocked=${data.prepareValidationBlocked ? 'yes' : 'no'}；everBlocked=${everBlocked ? 'yes' : 'no'}`);
+
+  data.toolsUsed = toolsUsed;
+  data.prepareAttempt = attempts.length || 1;
+  data.prepareRetryUsed = retryUsed;
+  data.prepareFinalActionCount = actions.length;
+  data.prepareValidationEverBlocked = everBlocked;
+  data.prepareValidationHistory = attempts;
+
+  if (everBlocked && actions.length > 0) {
+    data.reply = `首次变更预览未通过安全校验，系统已自动重试并重新校验通过。\n\n${data.reply}`;
+  }
 }
 
 function rebuildResponse(originalResponse, data) {
@@ -322,8 +365,12 @@ export async function onRequestPost(context) {
   try {
     let responseData = await parseAgentResponse(response, mode);
     responseData = await validatePreparedPreview(responseData, env);
+
     let prepareRetryUsed = false;
-    let prepareAttempt = 1;
+    const prepareAttempts = [];
+    if (mode === 'prepare_changes' && responseData?.code === 200) {
+      prepareAttempts.push(snapshotPrepareAttempt(responseData, 1));
+    }
 
     if (
       mode === 'prepare_changes' &&
@@ -333,7 +380,6 @@ export async function onRequestPost(context) {
       responseData.data.actions.length === 0
     ) {
       prepareRetryUsed = true;
-      prepareAttempt = 2;
       const retryBody = {
         ...body,
         requestMode: mode,
@@ -349,13 +395,13 @@ export async function onRequestPost(context) {
         response = retryResponse;
         responseData = await parseAgentResponse(retryResponse, mode);
         responseData = await validatePreparedPreview(responseData, env);
+        prepareAttempts.push(snapshotPrepareAttempt(responseData, 2));
       }
     }
 
     if (responseData?.data) {
-      responseData.data.prepareRetryUsed = prepareRetryUsed;
       responseData = ensureTruthfulPrepareResponse(responseData);
-      appendPrepareAudit(responseData, prepareAttempt, prepareRetryUsed);
+      appendPrepareAudit(responseData, prepareAttempts, prepareRetryUsed);
     }
 
     if (response.ok && responseData?.code === 200 && responseData?.data?.reply) {
