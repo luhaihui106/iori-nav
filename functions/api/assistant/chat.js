@@ -1,220 +1,269 @@
 import { isAdminAuthenticated, errorResponse, jsonResponse } from '../../_middleware';
-import { resolveWorkersAiModel } from '../../lib/workers-ai-models';
+import { normalizeBookmarkName, normalizeBookmarkDesc, normalizeCategoryName } from '../../lib/validators';
+import { callAssistantAi, loadAssistantAiSettings, parseAssistantJson } from '../../lib/assistant-ai';
+import { ASSISTANT_TOOL_GUIDE, executeAssistantTool } from '../../lib/assistant-tools';
 
-const MAX_CANDIDATES = 120;
-const MAX_ACTIONS = 100;
+const SESSION_TTL = 7 * 24 * 60 * 60;
+const MAX_HISTORY_MESSAGES = 10;
+const MAX_TOOL_ROUNDS = 7;
+const MAX_TOOL_CALLS_PER_ROUND = 6;
+const MAX_RESULTS = 12;
+const MAX_ACTIONS = 250;
 
-function normalizeText(value, max = 200) {
+function normalizeText(value, max = 1000) {
   return String(value || '').trim().slice(0, max);
 }
 
-function stripJsonFence(text) {
-  return String(text || '').replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+function normalizeSessionId(value) {
+  const raw = String(value || '').trim();
+  if (/^[a-zA-Z0-9_-]{8,80}$/.test(raw)) return raw;
+  return crypto.randomUUID();
 }
 
-function extractJson(text) {
-  const clean = stripJsonFence(text).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  try { return JSON.parse(clean); } catch {}
-  const start = clean.indexOf('{');
-  const end = clean.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    try { return JSON.parse(clean.slice(start, end + 1)); } catch {}
+function buildSessionKey(sessionId) {
+  return `assistant_session_${sessionId}`;
+}
+
+async function loadSession(env, sessionId) {
+  try {
+    const raw = await env.NAV_AUTH.get(buildSessionKey(sessionId));
+    if (!raw) return { history: [], lastResults: [], pendingActions: [], plan: null };
+    const parsed = JSON.parse(raw);
+    return {
+      history: Array.isArray(parsed.history) ? parsed.history.slice(-MAX_HISTORY_MESSAGES) : [],
+      lastResults: Array.isArray(parsed.lastResults) ? parsed.lastResults.slice(0, MAX_RESULTS) : [],
+      pendingActions: Array.isArray(parsed.pendingActions) ? parsed.pendingActions.slice(0, MAX_ACTIONS) : [],
+      plan: parsed.plan && typeof parsed.plan === 'object' ? parsed.plan : null,
+    };
+  } catch (error) {
+    console.warn('Failed to load assistant session:', error);
+    return { history: [], lastResults: [], pendingActions: [], plan: null };
   }
-  return null;
 }
 
-function isBroadScopeQuery(message) {
-  return /(全部|所有|全量|整体|目前所有|当前所有|整个|重新整理|重新分类|整体整理|整体分类)/.test(String(message || ''));
+async function saveSession(env, sessionId, session) {
+  const payload = {
+    history: (session.history || []).slice(-MAX_HISTORY_MESSAGES),
+    lastResults: (session.lastResults || []).slice(0, MAX_RESULTS),
+    pendingActions: (session.pendingActions || []).slice(0, MAX_ACTIONS),
+    plan: session.plan || null,
+    updatedAt: new Date().toISOString(),
+  };
+  await env.NAV_AUTH.put(buildSessionKey(sessionId), JSON.stringify(payload), { expirationTtl: SESSION_TTL });
 }
 
-function tokenizeQuery(message) {
-  const text = String(message || '')
-    .toLowerCase()
-    .replace(/[，。！？、；：,.!?;:()（）\[\]【】"'“”‘’]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const stopWords = new Set([
-    '帮我', '一下', '进行', '目前', '当前', '所有', '全部', '有些', '还有', '可能',
-    '就是', '比较', '不太', '合适', '你能', '分析', '整理', '分类', '重新', '网站', '网址',
-    '收藏', '书签', '页面', '命名', '分组', '完全', '访问', '正式', '现在', '我的', '可以',
-  ]);
-
-  const tokens = [];
-  for (const part of text.split(' ')) {
-    if (!part) continue;
-
-    if (/^[a-z0-9._:/-]+$/i.test(part)) {
-      if (part.length >= 2 && part.length <= 32) tokens.push(part);
-      continue;
-    }
-
-    const chineseParts = part.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-    for (const chunk of chineseParts) {
-      if (!stopWords.has(chunk) && chunk.length <= 12) tokens.push(chunk);
-    }
-
-    const asciiParts = part.match(/[a-z0-9._-]{2,32}/gi) || [];
-    tokens.push(...asciiParts);
-  }
-
-  return [...new Set(tokens.map(v => v.trim()).filter(v => v.length >= 2 && v.length <= 32))].slice(0, 8);
-}
-
-async function loadRecentCandidates(db, limit = MAX_CANDIDATES) {
-  const { results } = await db.prepare(`
-    SELECT id, name, url, desc, catelog_id, catelog_name, is_private, update_time
-    FROM sites ORDER BY update_time DESC, id DESC LIMIT ?
-  `).bind(limit).all();
-  return results || [];
-}
-
-async function loadCandidates(db, message) {
-  if (isBroadScopeQuery(message)) {
-    return loadRecentCandidates(db);
-  }
-
-  const tokens = tokenizeQuery(message);
-  if (!tokens.length) {
-    return loadRecentCandidates(db);
-  }
-
-  // 不使用 LIKE/GLOB。Cloudflare D1/SQLite 对复杂 LIKE pattern 有复杂度限制，
-  // 长中文自然语言指令可能触发 "LIKE or GLOB pattern too complex"。
-  // INSTR 做字面子串匹配，不把用户输入解释为 pattern，也避免 %/_ 通配符问题。
-  const clauses = [];
-  const params = [];
-  for (const token of tokens.slice(0, 6)) {
-    clauses.push(`(
-      INSTR(LOWER(COALESCE(name, '')), ?) > 0 OR
-      INSTR(LOWER(COALESCE(url, '')), ?) > 0 OR
-      INSTR(LOWER(COALESCE(desc, '')), ?) > 0 OR
-      INSTR(LOWER(COALESCE(catelog_name, '')), ?) > 0
-    )`);
-    params.push(token, token, token, token);
-  }
-
-  const sql = `
-    SELECT id, name, url, desc, catelog_id, catelog_name, is_private, update_time
-    FROM sites
-    WHERE ${clauses.join(' OR ')}
-    ORDER BY update_time DESC, id DESC
-    LIMIT ?
-  `;
-  params.push(MAX_CANDIDATES);
-  const { results } = await db.prepare(sql).bind(...params).all();
-
-  if ((results || []).length >= 8) return results || [];
-
-  // 模糊描述没有足够命中时，让 AI 从近期候选中二次判断，而不是直接返回空结果。
-  return loadRecentCandidates(db);
-}
-
-async function loadAiSettings(db) {
-  const keys = ['provider', 'apiKey', 'baseUrl', 'model'];
-  const { results } = await db.prepare(
-    `SELECT key, value FROM settings WHERE key IN (${keys.map(() => '?').join(',')})`
-  ).bind(...keys).all();
-  const settings = {};
-  for (const row of results || []) settings[row.key] = row.value;
-  return settings;
-}
-
-function getWorkersText(response) {
-  if (typeof response === 'string') return response;
-  return response?.response || response?.choices?.[0]?.message?.content || response?.result?.response || '';
-}
-
-async function callAi(env, settings, messages) {
+function buildSystemPrompt(settings, session) {
   const provider = settings.provider || 'workers-ai';
-  if (provider === 'workers-ai') {
-    if (!env.AI) throw new Error('Workers AI binding (env.AI) not found');
-    const model = resolveWorkersAiModel(settings.model, env.WORKERS_AI_MODEL);
-    return getWorkersText(await env.AI.run(model, { messages }));
-  }
+  const model = settings.model || (provider === 'workers-ai' ? '部署默认 Workers AI 模型' : '服务商默认模型');
+  const lastResults = (session.lastResults || []).map(item => ({ id: item.id, name: item.name, url: item.url, category: item.category }));
+  const pendingSummary = (session.pendingActions || []).slice(0, 30).map(action => ({
+    type: action.type,
+    siteId: action.siteId,
+    name: action.name,
+    category: action.category,
+    tempKey: action.tempKey,
+  }));
 
-  if (provider === 'openai') {
-    if (!settings.apiKey || !settings.baseUrl) throw new Error('OpenAI API 配置不完整');
-    const response = await fetch(`${settings.baseUrl.replace(/\/+$/, '')}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
-      body: JSON.stringify({ model: settings.model || 'gpt-4o-mini', messages, temperature: 0.2 })
-    });
-    if (!response.ok) throw new Error(`OpenAI API Error: ${await response.text()}`);
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || '';
-  }
-
-  if (provider === 'gemini') {
-    if (!settings.apiKey) throw new Error('Gemini API Key 未配置');
-    const model = settings.model || 'gemini-1.5-flash';
-    const system = messages.find(m => m.role === 'system')?.content || '';
-    const contents = messages.filter(m => m.role !== 'system').map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }));
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
-      body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: system }] }, generationConfig: { temperature: 0.2 } })
-    });
-    if (!response.ok) throw new Error(`Gemini API Error: ${await response.text()}`);
-    const data = await response.json();
-    return data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
-  }
-
-  throw new Error(`Unsupported provider: ${provider}`);
+  return `你是 iori-nav 的 AI 书签管理 Agent。你不是普通聊天机器人，而是可以通过后端工具读取真实书签库并提出受控操作方案的助手。\n\n` +
+    `当前 AI 提供商：${provider}；模型：${model}。如果用户询问你使用什么模型，可以如实说明这个信息。\n\n` +
+    `${ASSISTANT_TOOL_GUIDE}\n` +
+    `你的工作方式：\n` +
+    `- 先理解用户目标，再决定是否需要读取数据库。凡是涉及“我的书签/现有分类/那个网站/全部整理”等内容，都应优先调用工具获取真实数据。\n` +
+    `- 支持多轮上下文。用户说“第一个、这些、刚才那些”时，可结合最近结果继续处理。\n` +
+    `- 查找任务只返回结果，不生成写操作。\n` +
+    `- 修改、整理、重命名、重新分组等任务，只生成待确认 actions，不得直接执行数据库写入。\n` +
+    `- 可以规划新分类，但不得删除书签、删除分类、执行 SQL 或修改 URL。\n` +
+    `- 对全库整理，必须实际读取全库（按页读取）后再声称“已分析全部”。如果书签太多导致本轮无法全部读取，要明确说明覆盖范围并给出分阶段方案。\n\n` +
+    `最终答案必须严格返回 JSON，格式：\n` +
+    `{"type":"final","reply":"中文回复","results":[{"id":1,"reason":"匹配原因"}],` +
+    `"plan":{"title":"可选标题","summary":"可选方案摘要","scope":"覆盖范围","estimatedChanges":0},` +
+    `"actions":[` +
+    `{"type":"create_category","tempKey":"cat_network_test","name":"网络测试","parentId":0},` +
+    `{"type":"rename_bookmark","siteId":1,"name":"新名称"},` +
+    `{"type":"update_description","siteId":1,"description":"新描述"},` +
+    `{"type":"move_bookmark","siteId":1,"categoryId":2},` +
+    `{"type":"move_bookmark","siteId":1,"categoryRef":"cat_network_test","category":"网络测试"}` +
+    `]}。\n` +
+    `create_category 的 tempKey 仅用于本次方案内引用；新建子分类时可用 parentRef 指向另一个新分类 tempKey。` +
+    `move_bookmark 移动到已有分类用 categoryId，移动到本次新建分类用 categoryRef。\n\n` +
+    `最近一次搜索/分析结果：${JSON.stringify(lastResults)}\n` +
+    `上一轮待确认操作摘要：${JSON.stringify(pendingSummary)}\n`;
 }
 
-function validateAiPayload(payload, siteMap, categoryMap) {
+function sanitizePlan(plan) {
+  if (!plan || typeof plan !== 'object') return null;
+  return {
+    title: normalizeText(plan.title, 100),
+    summary: normalizeText(plan.summary, 1200),
+    scope: normalizeText(plan.scope, 300),
+    estimatedChanges: Math.max(0, Number.parseInt(plan.estimatedChanges, 10) || 0),
+  };
+}
+
+async function fetchValidationContext(db, payload) {
+  const siteIds = new Set();
+  for (const result of Array.isArray(payload?.results) ? payload.results : []) {
+    const id = Number.parseInt(result?.id, 10);
+    if (Number.isFinite(id) && id > 0) siteIds.add(id);
+  }
+  for (const action of Array.isArray(payload?.actions) ? payload.actions : []) {
+    const id = Number.parseInt(action?.siteId, 10);
+    if (Number.isFinite(id) && id > 0) siteIds.add(id);
+  }
+
+  let sites = [];
+  if (siteIds.size) {
+    const ids = [...siteIds].slice(0, MAX_ACTIONS + MAX_RESULTS);
+    const placeholders = ids.map(() => '?').join(',');
+    const query = await db.prepare(`
+      SELECT id, name, url, desc, catelog_id, catelog_name, is_private
+      FROM sites WHERE id IN (${placeholders})
+    `).bind(...ids).all();
+    sites = query.results || [];
+  }
+
+  const categoryQuery = await db.prepare('SELECT id, catelog, parent_id, is_private FROM category ORDER BY sort_order, id').all();
+  return {
+    siteMap: new Map(sites.map(site => [Number(site.id), site])),
+    categoryMap: new Map((categoryQuery.results || []).map(category => [Number(category.id), category])),
+  };
+}
+
+async function validateFinalPayload(db, payload) {
+  const { siteMap, categoryMap } = await fetchValidationContext(db, payload);
   const safe = {
-    reply: normalizeText(payload?.reply || '已完成分析。', 1000),
+    reply: normalizeText(payload?.reply || '已完成分析。', 2000),
     results: [],
+    plan: sanitizePlan(payload?.plan),
     actions: [],
   };
 
-  for (const item of Array.isArray(payload?.results) ? payload.results.slice(0, 8) : []) {
-    const id = Number(item?.id);
+  for (const item of (Array.isArray(payload?.results) ? payload.results : []).slice(0, MAX_RESULTS)) {
+    const id = Number.parseInt(item?.id, 10);
     const site = siteMap.get(id);
     if (!site) continue;
     safe.results.push({
       id,
-      name: site.name,
-      url: site.url,
+      name: site.name || '',
+      url: site.url || '',
       desc: site.desc || '',
       category: site.catelog_name || '',
-      reason: normalizeText(item?.reason || '', 160),
+      reason: normalizeText(item?.reason, 220),
     });
   }
 
-  for (const raw of Array.isArray(payload?.actions) ? payload.actions.slice(0, MAX_ACTIONS) : []) {
+  const rawActions = (Array.isArray(payload?.actions) ? payload.actions : []).slice(0, MAX_ACTIONS);
+  const createdRefs = new Set();
+
+  for (const raw of rawActions) {
+    if (raw?.type !== 'create_category') continue;
+    const tempKey = normalizeText(raw.tempKey, 80);
+    if (!/^[a-zA-Z0-9_-]{2,80}$/.test(tempKey) || createdRefs.has(tempKey)) continue;
+    const normalizedName = normalizeCategoryName(raw.name);
+    if (!normalizedName.ok) continue;
+
+    const parentId = Number.parseInt(raw.parentId, 10) || 0;
+    const parentRef = normalizeText(raw.parentRef, 80);
+    if (parentId > 0 && !categoryMap.has(parentId)) continue;
+    if (parentRef && !createdRefs.has(parentRef)) continue;
+
+    createdRefs.add(tempKey);
+    safe.actions.push({
+      type: 'create_category',
+      tempKey,
+      name: normalizedName.value,
+      parentId,
+      parentRef: parentRef || '',
+      isPrivate: Number(raw.isPrivate) === 1 ? 1 : 0,
+    });
+  }
+
+  for (const raw of rawActions) {
     const type = raw?.type;
-    const siteId = Number(raw?.siteId);
+    if (type === 'create_category') continue;
+
+    const siteId = Number.parseInt(raw?.siteId, 10);
     const site = siteMap.get(siteId);
-    if (!site || !['rename_bookmark', 'update_description', 'move_bookmark'].includes(type)) continue;
+    if (!site) continue;
 
     if (type === 'rename_bookmark') {
-      const name = normalizeText(raw?.name, 80);
-      if (name && name !== site.name) safe.actions.push({ type, siteId, name, currentName: site.name });
+      const normalized = normalizeBookmarkName(raw.name);
+      if (normalized.ok && normalized.value !== site.name) {
+        safe.actions.push({ type, siteId, name: normalized.value, currentName: site.name || '' });
+      }
+      continue;
     }
+
     if (type === 'update_description') {
-      const description = normalizeText(raw?.description, 300);
-      if (description && description !== (site.desc || '')) safe.actions.push({ type, siteId, description, currentDescription: site.desc || '' });
-    }
-    if (type === 'move_bookmark') {
-      const categoryId = Number(raw?.categoryId);
-      const category = categoryMap.get(categoryId);
-      if (category && categoryId !== Number(site.catelog_id)) {
+      const normalized = normalizeBookmarkDesc(raw.description);
+      if (normalized.ok && normalized.value && normalized.value !== (site.desc || '')) {
         safe.actions.push({
-          type, siteId, categoryId,
-          currentCategoryId: Number(site.catelog_id),
+          type,
+          siteId,
+          description: normalized.value,
+          currentDescription: site.desc || '',
+        });
+      }
+      continue;
+    }
+
+    if (type === 'move_bookmark') {
+      const categoryId = Number.parseInt(raw.categoryId, 10) || 0;
+      const categoryRef = normalizeText(raw.categoryRef, 80);
+      if (categoryId > 0 && categoryMap.has(categoryId) && categoryId !== Number(site.catelog_id)) {
+        const category = categoryMap.get(categoryId);
+        safe.actions.push({
+          type,
+          siteId,
+          categoryId,
+          category: category.catelog || '',
+          currentCategoryId: Number(site.catelog_id) || 0,
           currentCategory: site.catelog_name || '',
-          category: category.catelog,
+        });
+      } else if (categoryRef && createdRefs.has(categoryRef)) {
+        safe.actions.push({
+          type,
+          siteId,
+          categoryRef,
+          category: normalizeText(raw.category, 80) || categoryRef,
+          currentCategoryId: Number(site.catelog_id) || 0,
+          currentCategory: site.catelog_name || '',
         });
       }
     }
   }
+
   return safe;
+}
+
+function summarizeToolResult(name, result) {
+  if (name === 'library_stats') return `统计：${result.totalBookmarks || 0} 个书签，${result.totalCategories || 0} 个分类`;
+  if (name === 'list_categories') return `读取 ${Array.isArray(result) ? result.length : 0} 个分类`;
+  if (name === 'list_bookmarks') return `读取第 ${result.page || 1} 页 ${result.bookmarks?.length || 0}/${result.total || 0} 个书签`;
+  if (name === 'search_bookmarks') return `检索返回 ${result.bookmarks?.length || 0} 个候选`;
+  if (name === 'get_bookmarks') return `读取 ${result.bookmarks?.length || 0} 个指定书签`;
+  if (name === 'find_duplicates') return `发现 ${result.groups?.length || 0} 组重复 URL`;
+  return name;
+}
+
+async function runToolCalls(env, calls, trace) {
+  const safeCalls = (Array.isArray(calls) ? calls : []).slice(0, MAX_TOOL_CALLS_PER_ROUND);
+  const results = [];
+
+  for (const call of safeCalls) {
+    const name = normalizeText(call?.name, 80);
+    const args = call?.arguments && typeof call.arguments === 'object' ? call.arguments : {};
+    try {
+      const result = await executeAssistantTool(env, name, args);
+      results.push({ name, ok: true, result });
+      trace.push(summarizeToolResult(name, result));
+    } catch (error) {
+      results.push({ name, ok: false, error: error.message });
+      trace.push(`${name} 失败：${error.message}`);
+    }
+  }
+
+  return results;
 }
 
 export async function onRequestPost(context) {
@@ -222,49 +271,95 @@ export async function onRequestPost(context) {
   if (!(await isAdminAuthenticated(request, env))) return errorResponse('Unauthorized', 401);
 
   try {
+    if (!env.NAV_DB || !env.NAV_AUTH) return errorResponse('NAV_DB / NAV_AUTH binding not found', 500);
+
     const body = await request.json();
-    const message = normalizeText(body?.message, 1500);
+    const message = normalizeText(body?.message, 3000);
     if (!message) return errorResponse('请输入任务或问题', 400);
 
-    const [candidates, categoryResult, settings] = await Promise.all([
-      loadCandidates(env.NAV_DB, message),
-      env.NAV_DB.prepare('SELECT id, catelog, parent_id FROM category ORDER BY sort_order, id').all(),
-      loadAiSettings(env.NAV_DB),
+    const sessionId = normalizeSessionId(body?.sessionId);
+    const [settings, session] = await Promise.all([
+      loadAssistantAiSettings(env.NAV_DB),
+      loadSession(env, sessionId),
     ]);
 
-    const categories = categoryResult.results || [];
-    const siteMap = new Map(candidates.map(site => [Number(site.id), site]));
-    const categoryMap = new Map(categories.map(cat => [Number(cat.id), cat]));
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(settings, session) },
+      ...session.history
+        .filter(item => item && ['user', 'assistant'].includes(item.role) && item.content)
+        .slice(-MAX_HISTORY_MESSAGES)
+        .map(item => ({ role: item.role, content: normalizeText(item.content, 2500) })),
+      { role: 'user', content: message },
+    ];
 
-    const system = `你是 iori-nav 的 AI 书签助手。你只能基于提供的书签和分类工作。\n` +
-      `职责：1) 根据模糊描述找出用户想找的网站；2) 对书签提出重命名、修改描述、移动分类建议；3) 不得编造不存在的书签或分类。\n` +
-      `如果用户只是查找网站，actions 必须为空。只有用户明确要求修改、整理、重命名、重新分类时才生成 actions。\n` +
-      `当用户要求整体整理时，应先指出当前版本只能基于提供的候选和现有分类提出修改，不要声称已经分析了数据库中未提供的记录。\n` +
-      `绝不能删除书签、删除分类或执行 SQL。\n` +
-      `严格只返回 JSON：{"reply":"中文回复","results":[{"id":1,"reason":"匹配原因"}],"actions":[{"type":"rename_bookmark","siteId":1,"name":"新名称"},{"type":"update_description","siteId":1,"description":"新描述"},{"type":"move_bookmark","siteId":1,"categoryId":2}]}。`;
+    const toolTrace = [];
+    let finalPayload = null;
+    let invalidJsonRetries = 0;
 
-    const compactSites = candidates.map(site => ({
-      id: site.id,
-      name: site.name,
-      url: site.url,
-      desc: site.desc || '',
-      categoryId: site.catelog_id,
-      category: site.catelog_name || '',
-    }));
-    const compactCategories = categories.map(cat => ({ id: cat.id, name: cat.catelog, parentId: cat.parent_id || 0 }));
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const aiText = await callAssistantAi(env, settings, messages, { temperature: 0.12 });
+      const parsed = parseAssistantJson(aiText);
 
-    const aiText = await callAi(env, settings, [
-      { role: 'system', content: system },
-      { role: 'user', content: `用户任务：${message}\n\n可用分类：${JSON.stringify(compactCategories)}\n\n候选书签：${JSON.stringify(compactSites)}` }
-    ]);
+      if (!parsed) {
+        if (invalidJsonRetries >= 1) throw new Error('AI 连续返回非 JSON 内容，请重试或更换模型');
+        invalidJsonRetries++;
+        messages.push({ role: 'assistant', content: normalizeText(aiText, 2500) });
+        messages.push({ role: 'user', content: '你的上一次输出不是合法 JSON。请严格按工具调用或 final JSON 格式重新输出，不要附加 Markdown。' });
+        continue;
+      }
 
-    const parsed = extractJson(aiText);
-    if (!parsed) return errorResponse('AI 返回格式无效，请重试', 502);
+      if (parsed.type === 'tool_calls') {
+        const toolResults = await runToolCalls(env, parsed.calls, toolTrace);
+        if (!toolResults.length) {
+          messages.push({ role: 'user', content: '没有有效工具调用。请直接给出 final JSON，或使用工具指南中的合法工具名。' });
+          continue;
+        }
+        messages.push({ role: 'assistant', content: JSON.stringify(parsed) });
+        messages.push({ role: 'user', content: `TOOL_RESULTS:\n${JSON.stringify(toolResults)}` });
+        continue;
+      }
 
-    const data = validateAiPayload(parsed, siteMap, categoryMap);
-    return jsonResponse({ code: 200, data });
+      finalPayload = parsed.type === 'final' ? parsed : { ...parsed, type: 'final' };
+      break;
+    }
+
+    if (!finalPayload) {
+      messages.push({ role: 'user', content: '工具读取阶段已结束。现在不得再调用工具，请基于已获取的数据严格返回 final JSON；若没有覆盖全库，必须在 reply 和 plan.scope 中说明实际覆盖范围。' });
+      const aiText = await callAssistantAi(env, settings, messages, { temperature: 0.1 });
+      const parsed = parseAssistantJson(aiText);
+      if (!parsed) throw new Error('AI 未能生成有效的最终 JSON');
+      finalPayload = parsed.type === 'final' ? parsed : { ...parsed, type: 'final' };
+    }
+
+    const data = await validateFinalPayload(env.NAV_DB, finalPayload);
+    const nextHistory = [
+      ...session.history,
+      { role: 'user', content: message },
+      { role: 'assistant', content: data.reply },
+    ].slice(-MAX_HISTORY_MESSAGES);
+
+    await saveSession(env, sessionId, {
+      history: nextHistory,
+      lastResults: data.results,
+      pendingActions: data.actions,
+      plan: data.plan,
+    });
+
+    return jsonResponse({
+      code: 200,
+      data: {
+        sessionId,
+        provider: settings.provider || 'workers-ai',
+        model: settings.model || '',
+        reply: data.reply,
+        results: data.results,
+        plan: data.plan,
+        actions: data.actions,
+        toolsUsed: toolTrace,
+      },
+    });
   } catch (error) {
-    console.error('Assistant chat failed:', error);
+    console.error('Assistant Agent failed:', error);
     return errorResponse(`AI 助手处理失败: ${error.message}`, 500);
   }
 }
