@@ -1,12 +1,19 @@
-import { isAdminAuthenticated, errorResponse, jsonResponse, markHomeCacheDirty } from '../../_middleware';
+import { isAdminAuthenticated, errorResponse, jsonResponse, markHomeCacheDirty, timingSafeEqual } from '../../_middleware';
 import { normalizeBookmarkName, normalizeBookmarkDesc, normalizeCategoryName } from '../../lib/validators';
 
 const MAX_ACTIONS = 250;
 const BATCH_SIZE = 50;
 const UNDO_TTL = 7 * 24 * 60 * 60;
+const SESSION_TTL = 7 * 24 * 60 * 60;
+const SESSION_PREFIX = 'assistant_session_';
 
 function normalizeText(value, max = 120) {
   return String(value || '').trim().slice(0, max);
+}
+
+function normalizeSessionId(value) {
+  const raw = String(value || '').trim();
+  return /^[a-zA-Z0-9_-]{8,80}$/.test(raw) ? raw : '';
 }
 
 function chunks(items, size) {
@@ -23,7 +30,161 @@ async function executeBatches(db, statements) {
   }
 }
 
-async function createOrReuseCategory(env, raw, refMap, categoryMap, createdCategoryIds) {
+function stripPreviewMeta(action) {
+  if (!action || typeof action !== 'object') return null;
+  const safe = { ...action };
+  delete safe.previewToken;
+  delete safe.previewDigest;
+  return safe;
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function digestActions(actions) {
+  const bytes = new TextEncoder().encode(canonicalize(actions));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function restoreSnapshots(db, snapshots) {
+  const statements = snapshots.map(site => db.prepare(`
+    UPDATE sites
+    SET name = ?, url = ?, desc = ?, catelog_id = ?, catelog_name = ?, is_private = ?, update_time = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(
+    site.name,
+    site.url,
+    site.desc,
+    site.catelog_id,
+    site.catelog_name,
+    Number(site.is_private) || 0,
+    site.id
+  ));
+  await executeBatches(db, statements);
+}
+
+async function removeCreatedCategoriesIfUnused(db, categoryIds) {
+  let removed = 0;
+  for (const id of [...categoryIds].reverse()) {
+    const categoryId = Number.parseInt(id, 10);
+    if (!categoryId) continue;
+    const usage = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM sites WHERE catelog_id = ?) AS site_count,
+        (SELECT COUNT(*) FROM category WHERE parent_id = ?) AS child_count
+    `).bind(categoryId, categoryId).first();
+    if (Number(usage?.site_count || 0) === 0 && Number(usage?.child_count || 0) === 0) {
+      await db.prepare('DELETE FROM category WHERE id = ?').bind(categoryId).run();
+      removed++;
+    }
+  }
+  return removed;
+}
+
+async function saveUndoRecord(env, undoToken, payload) {
+  await env.NAV_AUTH.put(
+    `assistant_undo_${undoToken}`,
+    JSON.stringify(payload),
+    { expirationTtl: UNDO_TTL }
+  );
+}
+
+async function loadBoundPreview(env, body) {
+  const sessionId = normalizeSessionId(body?.sessionId);
+  const clientActions = (Array.isArray(body?.actions) ? body.actions : [])
+    .slice(0, MAX_ACTIONS)
+    .map(stripPreviewMeta)
+    .filter(Boolean);
+  const embeddedToken = Array.isArray(body?.actions)
+    ? body.actions.map(action => normalizeText(action?.previewToken, 120)).find(Boolean)
+    : '';
+  const previewToken = normalizeText(body?.previewToken || embeddedToken, 120);
+
+  if (!sessionId) throw Object.assign(new Error('缺少有效会话ID'), { status: 400 });
+  if (!previewToken) throw Object.assign(new Error('缺少预览令牌，请重新生成待确认变更'), { status: 409 });
+
+  const key = `${SESSION_PREFIX}${sessionId}`;
+  const raw = await env.NAV_AUTH.get(key);
+  if (!raw) throw Object.assign(new Error('会话不存在或已过期，请重新生成预览'), { status: 409 });
+
+  const session = JSON.parse(raw);
+  const preview = session?.preview && typeof session.preview === 'object' ? session.preview : null;
+  const storedActions = (Array.isArray(session?.pendingActions) ? session.pendingActions : [])
+    .slice(0, MAX_ACTIONS)
+    .map(stripPreviewMeta)
+    .filter(Boolean);
+
+  if (!preview || preview.status !== 'ready' || !preview.token) {
+    throw Object.assign(new Error('当前会话没有可执行的已确认预览，请重新生成'), { status: 409 });
+  }
+  if (!timingSafeEqual(String(preview.token), previewToken)) {
+    throw Object.assign(new Error('预览令牌不匹配或已失效，请重新生成预览'), { status: 409 });
+  }
+  const expiresAt = Date.parse(preview.expiresAt || '');
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    throw Object.assign(new Error('预览已过期，请重新生成'), { status: 410 });
+  }
+  if (!storedActions.length || storedActions.length !== Number(preview.actionCount || 0)) {
+    throw Object.assign(new Error('服务器预览动作已变化，请重新生成'), { status: 409 });
+  }
+
+  const storedDigest = await digestActions(storedActions);
+  if (!preview.digest || !timingSafeEqual(String(preview.digest), storedDigest)) {
+    throw Object.assign(new Error('服务器预览摘要校验失败，请重新生成'), { status: 409 });
+  }
+
+  if (clientActions.length) {
+    if (clientActions.length !== storedActions.length) {
+      throw Object.assign(new Error('前端待确认动作数量与服务器预览不一致'), { status: 409 });
+    }
+    const clientDigest = await digestActions(clientActions);
+    if (!timingSafeEqual(clientDigest, storedDigest)) {
+      throw Object.assign(new Error('前端待确认动作与服务器预览不一致，已拒绝执行'), { status: 409 });
+    }
+  }
+
+  return { sessionId, key, session, preview, actions: storedActions, digest: storedDigest };
+}
+
+async function consumePreview(env, bound) {
+  const now = new Date().toISOString();
+  await env.NAV_AUTH.put(bound.key, JSON.stringify({
+    ...bound.session,
+    updatedAt: now,
+    pendingActions: [],
+    preview: {
+      ...bound.preview,
+      token: '',
+      status: 'applying',
+      consumedAt: now,
+    },
+  }), { expirationTtl: SESSION_TTL });
+}
+
+async function finalizePreview(env, bound, status, extra = {}) {
+  const currentRaw = await env.NAV_AUTH.get(bound.key);
+  const current = currentRaw ? JSON.parse(currentRaw) : bound.session;
+  await env.NAV_AUTH.put(bound.key, JSON.stringify({
+    ...current,
+    updatedAt: new Date().toISOString(),
+    pendingActions: [],
+    preview: {
+      ...(current?.preview || bound.preview || {}),
+      token: '',
+      status,
+      ...extra,
+    },
+  }), { expirationTtl: SESSION_TTL });
+}
+
+async function createOrReuseCategory(env, raw, refMap, categoryMap, createdCategoryIds, onCreated) {
   const tempKey = normalizeText(raw?.tempKey, 80);
   if (!/^[a-zA-Z0-9_-]{2,80}$/.test(tempKey)) return null;
 
@@ -64,6 +225,7 @@ async function createOrReuseCategory(env, raw, refMap, categoryMap, createdCateg
   refMap.set(tempKey, id);
   categoryMap.set(id, created);
   createdCategoryIds.push(id);
+  if (onCreated) await onCreated(id);
   return { id, name: created.catelog, reused: false };
 }
 
@@ -71,12 +233,29 @@ export async function onRequestPost(context) {
   const { request, env } = context;
   if (!(await isAdminAuthenticated(request, env))) return errorResponse('Unauthorized', 401);
 
+  let bound = null;
+  let undoToken = '';
+  let undoPrepared = false;
+  let snapshots = [];
+  const createdCategoryIds = [];
+  const createdCategoryNames = [];
+
   try {
     if (!env.NAV_DB || !env.NAV_AUTH) return errorResponse('NAV_DB / NAV_AUTH binding not found', 500);
 
-    const { actions } = await request.json();
-    if (!Array.isArray(actions) || !actions.length) return errorResponse('没有可执行的变更', 400);
+    const body = await request.json();
+    try {
+      bound = await loadBoundPreview(env, body);
+    } catch (error) {
+      return errorResponse(error.message, Number(error.status) || 409);
+    }
+
+    const actions = bound.actions;
+    if (!Array.isArray(actions) || !actions.length) return errorResponse('没有可执行的服务器预览', 400);
     if (actions.length > MAX_ACTIONS) return errorResponse(`单次最多执行 ${MAX_ACTIONS} 个变更`, 400);
+
+    // 一次性消费预览令牌。此步骤必须先成功，D1 才允许开始写入。
+    await consumePreview(env, bound);
 
     const siteIds = [...new Set(actions
       .filter(action => action?.type !== 'create_category')
@@ -93,18 +272,45 @@ export async function onRequestPost(context) {
       sites = query.results || [];
     }
     const siteMap = new Map(sites.map(site => [Number(site.id), site]));
+    if (siteMap.size !== siteIds.length) throw new Error('预览中的书签已不存在或发生变化，请重新生成预览');
 
     const categoryQuery = await env.NAV_DB.prepare('SELECT id, catelog, parent_id, is_private FROM category').all();
     const categoryMap = new Map((categoryQuery.results || []).map(category => [Number(category.id), category]));
     const refMap = new Map();
-    const createdCategoryIds = [];
-    const createdCategoryNames = [];
 
-    // 分类必须先落库，后续 move_bookmark 才能通过 categoryRef 引用真实 ID。
+    // 在任何 D1 写操作前保存完整书签快照。后续任何失败都尝试自动回滚。
+    snapshots = siteIds.map(id => siteMap.get(id)).filter(Boolean);
+    undoToken = crypto.randomUUID();
+    const undoBase = {
+      status: 'prepared',
+      sessionId: bound.sessionId,
+      previewDigest: bound.digest,
+      createdAt: new Date().toISOString(),
+      snapshots,
+      createdCategoryIds: [],
+    };
+    await saveUndoRecord(env, undoToken, undoBase);
+    undoPrepared = true;
+
     for (const raw of actions) {
       if (raw?.type !== 'create_category') continue;
-      const created = await createOrReuseCategory(env, raw, refMap, categoryMap, createdCategoryIds);
-      if (created && !created.reused) createdCategoryNames.push(created.name);
+      const created = await createOrReuseCategory(
+        env,
+        raw,
+        refMap,
+        categoryMap,
+        createdCategoryIds,
+        async () => {
+          await saveUndoRecord(env, undoToken, {
+            ...undoBase,
+            status: 'prepared',
+            createdCategoryIds: [...createdCategoryIds],
+          });
+        }
+      );
+      if (!created) throw new Error(`新建分类动作已失效：${raw?.name || raw?.tempKey || '未知分类'}`);
+      if (created.reused) throw new Error(`预览中的新建分类“${created.name}”已存在，请重新生成预览`);
+      createdCategoryNames.push(created.name);
     }
 
     const valid = [];
@@ -113,21 +319,28 @@ export async function onRequestPost(context) {
       if (type === 'create_category') continue;
 
       const siteId = Number.parseInt(raw?.siteId, 10);
-      if (!siteMap.has(siteId)) continue;
+      const currentSite = siteMap.get(siteId);
+      if (!currentSite) throw new Error(`书签 #${siteId || '?'} 已不存在，请重新生成预览`);
 
       if (type === 'rename_bookmark') {
         const normalized = normalizeBookmarkName(raw?.name);
-        if (normalized.ok && normalized.value !== siteMap.get(siteId).name) {
-          valid.push({ type, siteId, name: normalized.value });
+        if (!normalized.ok) throw new Error(`书签 #${siteId} 的重命名内容无效`);
+        if (raw?.currentName !== undefined && String(raw.currentName) !== String(currentSite.name || '')) {
+          throw new Error(`书签 #${siteId} 名称已变化，请重新生成预览`);
         }
+        if (normalized.value === currentSite.name) throw new Error(`书签 #${siteId} 已是目标名称，请重新生成预览`);
+        valid.push({ type, siteId, name: normalized.value });
         continue;
       }
 
       if (type === 'update_description') {
         const normalized = normalizeBookmarkDesc(raw?.description);
-        if (normalized.ok && normalized.value && normalized.value !== (siteMap.get(siteId).desc || '')) {
-          valid.push({ type, siteId, description: normalized.value });
+        if (!normalized.ok || !normalized.value) throw new Error(`书签 #${siteId} 的描述内容无效`);
+        if (raw?.currentDescription !== undefined && String(raw.currentDescription || '') !== String(currentSite.desc || '')) {
+          throw new Error(`书签 #${siteId} 描述已变化，请重新生成预览`);
         }
+        if (normalized.value === (currentSite.desc || '')) throw new Error(`书签 #${siteId} 已是目标描述，请重新生成预览`);
+        valid.push({ type, siteId, description: normalized.value });
         continue;
       }
 
@@ -135,20 +348,23 @@ export async function onRequestPost(context) {
         let categoryId = Number.parseInt(raw?.categoryId, 10) || 0;
         const categoryRef = normalizeText(raw?.categoryRef, 80);
         if (!categoryId && categoryRef) categoryId = Number(refMap.get(categoryRef) || 0);
-        if (categoryId && categoryMap.has(categoryId) && categoryId !== Number(siteMap.get(siteId).catelog_id)) {
-          valid.push({ type, siteId, categoryId });
+        if (!categoryId || !categoryMap.has(categoryId)) throw new Error(`书签 #${siteId} 的目标分类已失效，请重新生成预览`);
+        if (raw?.currentCategoryId !== undefined && Number(raw.currentCategoryId || 0) !== Number(currentSite.catelog_id || 0)) {
+          throw new Error(`书签 #${siteId} 当前分类已变化，请重新生成预览`);
         }
+        if (categoryId === Number(currentSite.catelog_id)) throw new Error(`书签 #${siteId} 已在目标分类，请重新生成预览`);
+        valid.push({ type, siteId, categoryId });
+        continue;
       }
+
+      throw new Error(`存在不受支持的预览动作：${String(type || 'unknown')}`);
     }
 
-    if (!valid.length && !createdCategoryIds.length) {
-      return errorResponse('没有通过校验的变更', 400);
+    if (valid.length + createdCategoryIds.length !== actions.length) {
+      throw new Error('服务器最终可执行动作数量与已确认预览不一致');
     }
 
-    const affectedSiteIds = [...new Set(valid.map(action => action.siteId))];
-    const snapshots = affectedSiteIds.map(id => siteMap.get(id)).filter(Boolean);
     const statements = [];
-
     for (const action of valid) {
       if (action.type === 'rename_bookmark') {
         statements.push(
@@ -173,28 +389,68 @@ export async function onRequestPost(context) {
     }
 
     await executeBatches(env.NAV_DB, statements);
+
+    await saveUndoRecord(env, undoToken, {
+      ...undoBase,
+      status: 'applied',
+      appliedAt: new Date().toISOString(),
+      snapshots,
+      createdCategoryIds: [...createdCategoryIds],
+    });
+    await finalizePreview(env, bound, 'applied', { appliedAt: new Date().toISOString(), undoToken });
     await markHomeCacheDirty(env, 'all');
 
-    const undoToken = crypto.randomUUID();
-    await env.NAV_AUTH.put(
-      `assistant_undo_${undoToken}`,
-      JSON.stringify({ snapshots, createdCategoryIds }),
-      { expirationTtl: UNDO_TTL }
-    );
-
-    const applied = valid.length + createdCategoryIds.length;
+    const applied = actions.length;
     return jsonResponse({
       code: 200,
-      message: `已执行 ${applied} 个变更${createdCategoryNames.length ? `，新建 ${createdCategoryNames.length} 个分类` : ''}`,
+      message: `已执行 ${applied} 个已确认变更${createdCategoryNames.length ? `，新建 ${createdCategoryNames.length} 个分类` : ''}`,
       data: {
         applied,
         changedBookmarks: valid.length,
         createdCategories: createdCategoryNames,
         undoToken,
+        previewDigest: bound.digest,
       },
     });
   } catch (error) {
     console.error('Assistant apply failed:', error);
-    return errorResponse(`执行失败: ${error.message}`, 500);
+
+    let rollbackError = null;
+    if (undoPrepared && env.NAV_DB && env.NAV_AUTH) {
+      try {
+        if (snapshots.length) await restoreSnapshots(env.NAV_DB, snapshots);
+        if (createdCategoryIds.length) await removeCreatedCategoriesIfUnused(env.NAV_DB, createdCategoryIds);
+        if (undoToken) await env.NAV_AUTH.delete(`assistant_undo_${undoToken}`);
+        if (bound) await finalizePreview(env, bound, 'failed_rolled_back', { failedAt: new Date().toISOString() });
+        await markHomeCacheDirty(env, 'all');
+      } catch (rollbackFailure) {
+        rollbackError = rollbackFailure;
+        console.error('Assistant automatic rollback failed:', rollbackFailure);
+        if (undoToken) {
+          try {
+            await saveUndoRecord(env, undoToken, {
+              status: 'rollback_failed',
+              sessionId: bound?.sessionId || '',
+              previewDigest: bound?.digest || '',
+              failedAt: new Date().toISOString(),
+              snapshots,
+              createdCategoryIds: [...createdCategoryIds],
+              error: String(error?.message || error),
+              rollbackError: String(rollbackFailure?.message || rollbackFailure),
+            });
+          } catch {}
+        }
+      }
+    }
+
+    if (rollbackError && undoToken) {
+      return jsonResponse({
+        code: 500,
+        message: `执行失败且自动回滚未完全成功，请立即使用恢复令牌 ${undoToken} 执行撤销：${error.message}`,
+        data: { undoToken, recoveryRequired: true },
+      }, 500);
+    }
+
+    return errorResponse(`执行失败${undoPrepared ? '，已自动回滚' : ''}: ${error.message}`, 500);
   }
 }
