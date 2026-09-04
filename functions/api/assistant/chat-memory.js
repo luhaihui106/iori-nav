@@ -74,10 +74,10 @@ async function loadRawSession(env, sessionId) {
 
 function detectRequestMode(message) {
   const text = String(message || '').replace(/\s+/g, ' ');
-  const explicitNoPreview = /(不要|不用|不需要|先别|暂不).{0,10}(生成|做|给出|给我)?{0,1}.{0,6}预览|不要预览/.test(text);
+  const explicitNoPreview = /((不要|不用|不需要|先别|暂不).{0,16}预览|不要预览)/.test(text);
   const analysisOnly = /(只给方案|先给方案|仅给方案|先不要修改|不要修改任何数据|不要修改数据|不修改数据|先别修改|仅分析|只分析|先分析|只做分析|不要生成可执行)/.test(text);
 
-  if (explicitNoPreview && analysisOnly) return 'analysis_only';
+  if (explicitNoPreview) return 'analysis_only';
 
   const mentionsPreview = /预览/.test(text);
   const prepareChanges = mentionsPreview ||
