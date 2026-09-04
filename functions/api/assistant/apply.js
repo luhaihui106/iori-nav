@@ -6,6 +6,7 @@ const BATCH_SIZE = 50;
 const UNDO_TTL = 7 * 24 * 60 * 60;
 const SESSION_TTL = 7 * 24 * 60 * 60;
 const SESSION_PREFIX = 'assistant_session_';
+const PREVIEW_CLAIM_PREFIX = 'assistant_preview_claim_';
 
 function normalizeText(value, max = 120) {
   return String(value || '').trim().slice(0, max);
@@ -47,10 +48,42 @@ function canonicalize(value) {
   return JSON.stringify(value);
 }
 
-async function digestActions(actions) {
-  const bytes = new TextEncoder().encode(canonicalize(actions));
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(String(value || ''));
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function digestActions(actions) {
+  return sha256Hex(canonicalize(actions));
+}
+
+async function claimPreviewConsumption(env, bound) {
+  // KV 的 read -> put 不是 compare-and-swap。这里复用现有 settings(key PRIMARY KEY)
+  // 作为 D1 原子消费墓碑：同一个随机 previewToken 只有一个并发请求能插入成功。
+  // key 中只保存 token 的 SHA-256，不把实际 previewToken 落入 D1。
+  const tokenHash = await sha256Hex(bound?.preview?.token || '');
+  if (!tokenHash) throw Object.assign(new Error('预览令牌摘要无效，请重新生成预览'), { status: 409 });
+
+  const claimKey = `${PREVIEW_CLAIM_PREFIX}${tokenHash}`;
+  const claimValue = JSON.stringify({
+    sessionId: bound.sessionId,
+    previewDigest: bound.digest,
+    claimedAt: new Date().toISOString(),
+  });
+
+  const claimed = await env.NAV_DB.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO NOTHING
+    RETURNING key
+  `).bind(claimKey, claimValue).first();
+
+  if (!claimed?.key) {
+    throw Object.assign(new Error('该预览已被其他请求消费或正在执行，请重新生成预览'), { status: 409 });
+  }
+
+  return claimKey;
 }
 
 async function restoreSnapshots(db, snapshots) {
@@ -234,6 +267,7 @@ export async function onRequestPost(context) {
   if (!(await isAdminAuthenticated(request, env))) return errorResponse('Unauthorized', 401);
 
   let bound = null;
+  let previewClaimed = false;
   let undoToken = '';
   let undoPrepared = false;
   let snapshots = [];
@@ -254,7 +288,15 @@ export async function onRequestPost(context) {
     if (!Array.isArray(actions) || !actions.length) return errorResponse('没有可执行的服务器预览', 400);
     if (actions.length > MAX_ACTIONS) return errorResponse(`单次最多执行 ${MAX_ACTIONS} 个变更`, 400);
 
-    // 一次性消费预览令牌。此步骤必须先成功，D1 才允许开始写入。
+    // 先通过 D1 主键唯一约束原子抢占消费权，再更新 KV 状态。
+    // 即使两个请求同时读取到 KV ready，只有一个请求能继续进入任何业务写入。
+    try {
+      await claimPreviewConsumption(env, bound);
+      previewClaimed = true;
+    } catch (error) {
+      return errorResponse(error.message, Number(error.status) || 409);
+    }
+
     await consumePreview(env, bound);
 
     const siteIds = [...new Set(actions
@@ -278,7 +320,7 @@ export async function onRequestPost(context) {
     const categoryMap = new Map((categoryQuery.results || []).map(category => [Number(category.id), category]));
     const refMap = new Map();
 
-    // 在任何 D1 写操作前保存完整书签快照。后续任何失败都尝试自动回滚。
+    // 在任何书签/分类业务写操作前保存完整书签快照。后续任何失败都尝试自动回滚。
     snapshots = siteIds.map(id => siteMap.get(id)).filter(Boolean);
     undoToken = crypto.randomUUID();
     const undoBase = {
@@ -414,6 +456,16 @@ export async function onRequestPost(context) {
     });
   } catch (error) {
     console.error('Assistant apply failed:', error);
+
+    // 已取得 D1 原子消费权、但还没形成 undo 快照时也必须让 KV preview 失效。
+    // claim 墓碑永久保留，保证任何已拿到旧 bound 的并发请求也无法迟到重放。
+    if (previewClaimed && !undoPrepared && bound && env.NAV_AUTH) {
+      try {
+        await finalizePreview(env, bound, 'claim_failed', { failedAt: new Date().toISOString() });
+      } catch (finalizeFailure) {
+        console.error('Failed to finalize claimed preview after apply error:', finalizeFailure);
+      }
+    }
 
     let rollbackError = null;
     if (undoPrepared && env.NAV_DB && env.NAV_AUTH) {
