@@ -121,6 +121,45 @@
     box.textContent = `Agent 已执行：${items.join('；')}`;
   }
 
+  function providerLabel(provider) {
+    if (provider === 'openai') return 'OpenAI 兼容';
+    if (provider === 'workers-ai') return 'Workers AI';
+    if (provider === 'gemini') return 'Gemini';
+    return provider || '未知';
+  }
+
+  function renderRuntime(runtime) {
+    const box = document.getElementById('ioriAssistantRuntime');
+    if (!box) return;
+    box.innerHTML = '';
+    box.className = '';
+
+    if (!runtime || (!runtime.primaryProvider && !runtime.actualProvider)) {
+      box.style.display = 'none';
+      return;
+    }
+
+    const primaryName = runtime.primaryModel || providerLabel(runtime.primaryProvider);
+    const finalName = runtime.finalModel || runtime.actualModel || providerLabel(runtime.finalProvider || runtime.actualProvider);
+    const lines = [];
+
+    if (runtime.status) lines.push(runtime.status);
+
+    if (runtime.fallbackUsed) {
+      const fallbackName = runtime.fallbackActualModel || runtime.fallbackModel || providerLabel(runtime.fallbackActualProvider || runtime.fallbackProvider);
+      const recovery = runtime.recoveredToPrimary ? '已恢复主模型' : '当前仍由备用模型完成';
+      lines.push(`主模型：${primaryName} · 备用实际：${fallbackName} · 最终：${finalName} · ${recovery}`);
+      if (Number(runtime.fallbackCount) > 1) lines.push(`本次 Agent 共触发备用模型 ${runtime.fallbackCount} 次。`);
+      box.className = 'iori-runtime-warning';
+    } else {
+      lines.push(`主模型：${primaryName} · 最终：${finalName}`);
+      box.className = 'iori-runtime-ok';
+    }
+
+    box.style.display = 'block';
+    box.textContent = lines.filter(Boolean).join('\n');
+  }
+
   function actionLabel(action) {
     if (action.type === 'create_category') {
       const parent = action.parentRef ? `（父分类：${action.parentRef}）` : '';
@@ -157,6 +196,7 @@
     renderResults([]);
     renderPlan(null);
     renderTrace([]);
+    renderRuntime(null);
   }
 
   async function sendMessage(textOverride = '') {
@@ -186,6 +226,7 @@
       }
 
       appendMessage('ai', data.data.reply || '已完成分析。');
+      renderRuntime(data.data.runtime || null);
       renderTrace(data.data.toolsUsed || []);
       renderPlan(data.data.plan || null);
       renderResults(data.data.results || []);
@@ -284,6 +325,7 @@
       .iori-assistant-body{display:flex;flex-direction:column;height:calc(100% - 52px)}
       #ioriAssistantMessages{flex:1;overflow:auto;padding:14px;background:#f8fafc;min-height:120px}.iori-assistant-msg{max-width:90%;padding:10px 12px;border-radius:12px;margin-bottom:10px;white-space:pre-wrap;font-size:14px;line-height:1.55}.iori-assistant-msg.user{margin-left:auto;background:#2563eb;color:#fff}.iori-assistant-msg.ai{background:#fff;border:1px solid #e5e7eb;color:#111827}
       .iori-assistant-quick{display:flex;gap:6px;overflow-x:auto;padding:8px 10px;border-top:1px solid #e5e7eb;background:#fff}.iori-assistant-quick button{border:1px solid #dbe2ea;background:#f8fafc;color:#334155;border-radius:999px;padding:6px 10px;font-size:12px;white-space:nowrap;cursor:pointer}.iori-assistant-quick button:hover{background:#eef2ff;border-color:#c7d2fe}
+      #ioriAssistantRuntime{padding:8px 12px;font-size:11px;line-height:1.5;border-top:1px solid #e5e7eb;white-space:pre-wrap}.iori-runtime-ok{background:#f0fdf4;color:#166534;border-color:#bbf7d0!important}.iori-runtime-warning{background:#fff7ed;color:#9a3412;border-color:#fed7aa!important}
       #ioriAssistantTrace{padding:7px 12px;background:#eff6ff;color:#1e40af;font-size:11px;line-height:1.45;border-top:1px solid #dbeafe}
       #ioriAssistantPlan,#ioriAssistantResults,#ioriAssistantActions{padding:10px 12px;border-top:1px solid #e5e7eb;background:#fff;max-height:210px;overflow:auto}.iori-assistant-section-title{font-weight:700;font-size:13px;color:#111827;margin-bottom:5px}.iori-assistant-plan-text{font-size:12px;line-height:1.55;color:#334155;white-space:pre-wrap}.iori-assistant-plan-scope{font-size:11px;color:#64748b;margin-top:4px}.iori-assistant-result{padding:8px 0;border-bottom:1px solid #f1f5f9}.iori-assistant-result:last-child{border-bottom:0}.iori-assistant-result-title{font-weight:600;font-size:13px}.iori-assistant-result a{font-size:12px;color:#2563eb;word-break:break-all}.iori-assistant-result-meta{font-size:12px;color:#64748b;margin-top:3px}.iori-assistant-action-row{padding:7px 0;border-bottom:1px solid #f1f5f9;font-size:12px;color:#334155}.iori-assistant-action-row:last-child{border-bottom:0}
       .iori-assistant-actions-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:8px;position:sticky;bottom:0;background:white;padding-top:8px}.iori-assistant-actions-footer button{border:0;border-radius:8px;padding:8px 12px;cursor:pointer}.iori-assistant-apply{background:#16a34a;color:#fff}.iori-assistant-cancel{background:#e5e7eb;color:#111827}.iori-assistant-undo{background:#f59e0b;color:white;display:none;border:0;border-radius:7px;padding:5px 8px;font-size:11px;cursor:pointer;margin-top:4px}
@@ -310,6 +352,7 @@
           <button type="button" data-iori-agent-prompt="帮我分析目前没有描述的书签，给出补全描述的建议，先预览。">补描述</button>
           <button type="button" data-iori-agent-prompt="帮我找一个我记不清名字的网站。我接下来会描述它的用途。">找网站</button>
         </div>
+        <div id="ioriAssistantRuntime" style="display:none"></div>
         <div id="ioriAssistantTrace" style="display:none"></div>
         <div id="ioriAssistantPlan" style="display:none"></div>
         <div id="ioriAssistantResults" style="display:none"></div>
