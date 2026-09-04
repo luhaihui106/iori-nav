@@ -29,6 +29,15 @@
     );
   }
 
+  function loadCategoryBatchScript() {
+    loadScript(
+      '/js/admin-category-batch.js',
+      'data-iori-category-batch',
+      () => Boolean(window.IoriCategoryBatch),
+      'category batch management'
+    );
+  }
+
   function loadQualityFixesScript() {
     loadScript(
       '/js/admin-quality-fixes.js',
@@ -97,6 +106,7 @@
       ?.catch?.(err => console.error('Failed to load categories:', err));
 
     loadBuildInfoScript();
+    loadCategoryBatchScript();
     loadFallbackSettingsScript();
     loadAssistantMemoryScript();
   }
