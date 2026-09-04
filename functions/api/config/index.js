@@ -5,12 +5,18 @@ import { normalizeBookmarkDesc, normalizeBookmarkLogo, normalizeBookmarkName, no
 
 const MAX_CONFIG_SEARCH_KEYWORD_LENGTH = 100;
 
+function booleanParam(value, fallback = true) {
+  if (value === null || value === undefined || value === '') return fallback;
+  return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
+}
+
 export async function onRequestGet(context) {
   const { request, env } = context;
 
   const url = new URL(request.url);
   const catalog = url.searchParams.get('catalog');
   const catalogId = url.searchParams.get('catalogId');
+  const includeDescendants = booleanParam(url.searchParams.get('includeDescendants'), true);
   const { page, pageSize, offset } = parsePagination(url.searchParams, { maxPageSize: 200 });
   const keyword = (url.searchParams.get('keyword') || '').trim();
 
@@ -22,14 +28,41 @@ export async function onRequestGet(context) {
   const includePrivate = isAuthenticated ? 1 : 0;
 
   try {
-    // 基础查询：不再关联 category，直接查 sites 表，提高性能
-    // 注意：始终筛选 (is_private = 0 OR includePrivate = 1)
+    let cte = '';
+    let cteBindParams = [];
     let queryBase = `FROM sites s WHERE (s.is_private = 0 OR ? = 1)`;
     let queryBindParams = [includePrivate];
+    let categoryScope = null;
 
     if (catalogId) {
-      queryBase += ` AND s.catelog_id = ?`;
-      queryBindParams.push(catalogId);
+      if (includeDescendants) {
+        cte = `WITH RECURSIVE category_scope(id) AS (
+          SELECT id FROM category WHERE id = ?
+          UNION ALL
+          SELECT c.id FROM category c JOIN category_scope cs ON c.parent_id = cs.id
+        )`;
+        cteBindParams.push(catalogId);
+        queryBase += ` AND s.catelog_id IN (SELECT id FROM category_scope)`;
+
+        const scopeRows = await env.NAV_DB.prepare(`
+          WITH RECURSIVE category_scope(id, catelog, parent_id) AS (
+            SELECT id, catelog, parent_id FROM category WHERE id = ?
+            UNION ALL
+            SELECT c.id, c.catelog, c.parent_id FROM category c JOIN category_scope cs ON c.parent_id = cs.id
+          )
+          SELECT id, catelog, parent_id FROM category_scope ORDER BY id
+        `).bind(catalogId).all();
+        const rows = scopeRows.results || [];
+        categoryScope = {
+          requestedId: Number(catalogId),
+          requestedName: rows[0]?.catelog || '',
+          includedIds: rows.map(row => Number(row.id)),
+          descendantCount: Math.max(0, rows.length - 1),
+        };
+      } else {
+        queryBase += ` AND s.catelog_id = ?`;
+        queryBindParams.push(catalogId);
+      }
     } else if (catalog) {
       queryBase += ` AND s.catelog_name = ?`;
       queryBindParams.push(catalog);
@@ -41,22 +74,26 @@ export async function onRequestGet(context) {
       queryBindParams.push(`%${escaped}%`, `%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
     }
 
-    const query = `SELECT * ${queryBase} ORDER BY sort_order ASC, create_time DESC LIMIT ? OFFSET ?`;
-    const countQuery = `SELECT COUNT(*) as total ${queryBase}`;
-    
-    // 添加分页参数
-    const fullBindParams = [...queryBindParams, pageSize, offset];
+    const query = `${cte} SELECT * ${queryBase} ORDER BY sort_order ASC, create_time DESC LIMIT ? OFFSET ?`;
+    const countQuery = `${cte} SELECT COUNT(*) as total ${queryBase}`;
+
+    const baseBindParams = [...cteBindParams, ...queryBindParams];
+    const fullBindParams = [...baseBindParams, pageSize, offset];
     const { results } = await env.NAV_DB.prepare(query).bind(...fullBindParams).all();
-    
-    const countResult = await env.NAV_DB.prepare(countQuery).bind(...queryBindParams).first();
-    const total = countResult ? countResult.total : 0;
+    const countResult = await env.NAV_DB.prepare(countQuery).bind(...baseBindParams).first();
+    const total = Number(countResult?.total || 0);
+    const totalPages = total === 0 ? 0 : Math.ceil(total / pageSize);
+    const safePage = total === 0 ? 0 : Math.min(page, totalPages);
 
     return jsonResponse({
       code: 200,
       data: results,
       total,
-      page,
-      pageSize
+      page: safePage,
+      pageSize,
+      totalPages,
+      includeDescendants: Boolean(catalogId && includeDescendants),
+      categoryScope,
     });
   } catch (e) {
     return errorResponse(`Failed to fetch config data: ${e.message}`, 500);
@@ -65,7 +102,7 @@ export async function onRequestGet(context) {
 
 export async function onRequestPost(context) {
   const { request, env } = context;
-  
+
   if (!(await isAdminAuthenticated(request, env))) {
     return errorResponse('Unauthorized', 401);
   }
@@ -103,26 +140,23 @@ export async function onRequestPost(context) {
       return errorResponse('URL must be a valid http or https URL', 400);
     }
 
-    // Check if URL already exists
     const urlCandidates = getUrlMatchCandidates(rawUrl);
     const placeholders = urlCandidates.map(() => '?').join(',');
     const existingSite = await env.NAV_DB.prepare(`SELECT id FROM sites WHERE url IN (${placeholders})`).bind(...urlCandidates).first();
     if (existingSite) {
-        return errorResponse('该 URL 已存在，请勿重复添加', 409);
+      return errorResponse('该 URL 已存在，请勿重复添加', 409);
     }
 
     sanitizedLogo = buildFaviconUrl(sanitizedUrl, sanitizedLogo, iconAPI);
-    // Find the category ID from the category name
     const categoryResult = await env.NAV_DB.prepare('SELECT catelog, is_private FROM category WHERE id = ?').bind(catelogId).first();
 
     if (!categoryResult) {
-      return errorResponse(`Category not found.`, 400);
+      return errorResponse('Category not found.', 400);
     }
-    
-    // If category is private, force site to be private
+
     let finalIsPrivate = isPrivateValue;
     if (categoryResult.is_private === 1) {
-        finalIsPrivate = 1;
+      finalIsPrivate = 1;
     }
 
     const insert = await env.NAV_DB.prepare(`
