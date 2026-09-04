@@ -23,16 +23,172 @@ function normalizeJsonPunctuation(text) {
     .replace(/：/g, ':');
 }
 
+function escapeRawControlsInStrings(text) {
+  const input = String(text || '');
+  let output = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (!inString) {
+      output += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+
+    if (escaped) {
+      output += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      output += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      output += ch;
+      inString = false;
+      continue;
+    }
+    if (ch === '\n') {
+      output += '\\n';
+      continue;
+    }
+    if (ch === '\r') {
+      output += '\\r';
+      continue;
+    }
+    if (ch === '\t') {
+      output += '\\t';
+      continue;
+    }
+    output += ch;
+  }
+  return output;
+}
+
+function convertSingleQuotedStrings(text) {
+  const input = String(text || '');
+  let output = '';
+  let mode = 'outside';
+  let escaped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (mode === 'outside') {
+      if (ch === "'") {
+        mode = 'single';
+        output += '"';
+      } else {
+        output += ch;
+        if (ch === '"') mode = 'double';
+      }
+      continue;
+    }
+
+    if (mode === 'double') {
+      output += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        mode = 'outside';
+      }
+      continue;
+    }
+
+    if (escaped) {
+      if (ch === "'") output += "'";
+      else if (ch === '"') output += '\\"';
+      else output += `\\${ch}`;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'") {
+      output += '"';
+      mode = 'outside';
+      continue;
+    }
+    if (ch === '"') {
+      output += '\\"';
+      continue;
+    }
+    if (ch === '\n') {
+      output += '\\n';
+      continue;
+    }
+    if (ch === '\r') {
+      output += '\\r';
+      continue;
+    }
+    if (ch === '\t') {
+      output += '\\t';
+      continue;
+    }
+    output += ch;
+  }
+
+  return output;
+}
+
 function repairJsonText(text) {
-  return normalizeJsonPunctuation(text)
+  return escapeRawControlsInStrings(normalizeJsonPunctuation(text)
     .replace(/^\uFEFF/, '')
     .replace(/,\s*([}\]])/g, '$1')
-    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3'))
     .trim();
 }
 
 function parseJsonCandidate(text) {
-  return tryParseJson(text) || tryParseJson(repairJsonText(text));
+  const direct = tryParseJson(text);
+  if (direct) return direct;
+
+  const repaired = repairJsonText(text);
+  const repairedParsed = tryParseJson(repaired);
+  if (repairedParsed) return repairedParsed;
+
+  const singleQuoted = convertSingleQuotedStrings(repaired);
+  return tryParseJson(singleQuoted);
+}
+
+function extractBalancedJson(text) {
+  const input = String(text || '');
+  for (let start = 0; start < input.length; start++) {
+    const opener = input[start];
+    if (opener !== '{' && opener !== '[') continue;
+    const closer = opener === '{' ? '}' : ']';
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+
+    for (let i = start; i < input.length; i++) {
+      const ch = input[i];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === opener) depth++;
+      else if (ch === closer) {
+        depth--;
+        if (depth === 0) return input.slice(start, i + 1);
+      }
+    }
+  }
+  return '';
 }
 
 export function parseAssistantJson(text) {
@@ -42,11 +198,9 @@ export function parseAssistantJson(text) {
   const direct = parseJsonCandidate(clean);
   if (direct) return direct;
 
-  const firstObject = clean.indexOf('{');
-  const lastObject = clean.lastIndexOf('}');
-  if (firstObject >= 0 && lastObject > firstObject) {
-    const objectText = clean.slice(firstObject, lastObject + 1);
-    const parsed = parseJsonCandidate(objectText);
+  const balanced = extractBalancedJson(clean);
+  if (balanced) {
+    const parsed = parseJsonCandidate(balanced);
     if (parsed) return parsed;
   }
 
