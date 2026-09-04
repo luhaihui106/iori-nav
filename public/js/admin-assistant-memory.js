@@ -44,6 +44,12 @@
     return item;
   }
 
+  function scrollConversationToBottom() {
+    const scroller = document.getElementById('ioriAssistantConversation');
+    if (!scroller) return;
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+  }
+
   async function restoreCurrentSession(force = false) {
     const sessionId = currentSessionId();
     const box = document.getElementById('ioriAssistantMessages');
@@ -59,8 +65,8 @@
 
       box.innerHTML = '';
       history.forEach(item => box.appendChild(createMessage(item.role, item.content)));
-      box.scrollTop = box.scrollHeight;
       restoredSessionId = sessionId;
+      scrollConversationToBottom();
 
       const hint = document.getElementById('ioriAssistantMemoryHint');
       if (hint) hint.textContent = `已恢复 ${Math.floor(history.length / 2)} 轮历史对话`;
