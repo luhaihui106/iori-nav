@@ -1,4 +1,4 @@
-const CODE_REVISION = 'assistant-r9-atomic-preview-20260904';
+const CODE_REVISION = 'category-batch-r1-20260905';
 
 export async function onRequestGet(context) {
   const { env } = context;
