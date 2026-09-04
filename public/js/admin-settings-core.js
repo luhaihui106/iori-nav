@@ -17,6 +17,7 @@
 
       if (data.code === 200 && data.data) {
         ns.defaults?.applyServerSettings?.(data.data, currentSettings);
+        ns.fallback?.applyServerSettings?.(data.data, currentSettings);
       }
     } catch (e) {
       console.error('Failed to load settings', e);
@@ -26,7 +27,9 @@
   }
 
   function collectSettingsFromInputs() {
-    return ns.form?.collectSettingsFromInputs?.();
+    const result = ns.form?.collectSettingsFromInputs?.() || currentSettings;
+    ns.fallback?.collect?.(currentSettings);
+    return result;
   }
 
   async function saveSettings() {
@@ -60,7 +63,9 @@
   }
 
   function updateUIFromSettings(options) {
-    return ns.form?.updateUIFromSettings?.(options);
+    const result = ns.form?.updateUIFromSettings?.(options);
+    ns.fallback?.updateUI?.(currentSettings);
+    return result;
   }
 
   function closeModal() {
@@ -168,9 +173,7 @@
     });
 
     refs.frostedGlassIntensityRange?.addEventListener('input', () => {
-      if (refs.frostedGlassIntensityValue) {
-        refs.frostedGlassIntensityValue.textContent = refs.frostedGlassIntensityRange.value;
-      }
+      if (refs.frostedGlassIntensityValue) refs.frostedGlassIntensityValue.textContent = refs.frostedGlassIntensityRange.value;
     });
 
     refs.bgBlurSwitch?.addEventListener('change', () => {
@@ -178,9 +181,7 @@
     });
 
     refs.bgBlurIntensityRange?.addEventListener('input', () => {
-      if (refs.bgBlurIntensityValue) {
-        refs.bgBlurIntensityValue.textContent = refs.bgBlurIntensityRange.value;
-      }
+      if (refs.bgBlurIntensityValue) refs.bgBlurIntensityValue.textContent = refs.bgBlurIntensityRange.value;
     });
 
     refs.mobileFrostedGlassSwitch?.addEventListener('change', () => {
@@ -188,9 +189,7 @@
     });
 
     refs.mobileFrostedGlassIntensityRange?.addEventListener('input', () => {
-      if (refs.mobileFrostedGlassIntensityValue) {
-        refs.mobileFrostedGlassIntensityValue.textContent = refs.mobileFrostedGlassIntensityRange.value;
-      }
+      if (refs.mobileFrostedGlassIntensityValue) refs.mobileFrostedGlassIntensityValue.textContent = refs.mobileFrostedGlassIntensityRange.value;
     });
   }
 
@@ -211,6 +210,7 @@
   function init() {
     const refs = getRefs();
     if (!refs.settingsBtn || !refs.settingsModal) return false;
+    ns.fallback?.init?.();
     initModalEvents(refs);
     initTabEvents(refs);
     initCardDeviceTabs();
