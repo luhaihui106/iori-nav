@@ -31,7 +31,7 @@
 
   function loadCategoryBatchScript() {
     loadScript(
-      '/js/admin-category-batch.js',
+      '/js/admin-category-batch.js?v=category-batch-r1-20260905',
       'data-iori-category-batch',
       () => Boolean(window.IoriCategoryBatch),
       'category batch management'
