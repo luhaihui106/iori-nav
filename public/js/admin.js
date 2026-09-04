@@ -20,12 +20,22 @@
     document.body.appendChild(script);
   }
 
+  function loadQualityFixesScript() {
+    loadScript(
+      '/js/admin-quality-fixes.js',
+      'data-iori-quality-fixes',
+      () => Boolean(window.IoriAdminQualityFixes),
+      'admin quality fixes'
+    );
+  }
+
   function loadAssistantWindowScript() {
     loadScript(
       '/js/admin-assistant-window.js',
       'data-iori-assistant-window',
       () => Boolean(window.IoriAssistantWindow),
-      'AI assistant window enhancement'
+      'AI assistant window enhancement',
+      loadQualityFixesScript
     );
   }
 
