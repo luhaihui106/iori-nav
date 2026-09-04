@@ -74,16 +74,13 @@ async function loadRawSession(env, sessionId) {
 
 function detectRequestMode(message) {
   const text = String(message || '').replace(/\s+/g, ' ');
-  const explicitNoPreview = /((不要|不用|不需要|先别|暂不).{0,16}预览|不要预览)/.test(text);
-  const analysisOnly = /(只给方案|先给方案|仅给方案|先不要修改|不要修改任何数据|不要修改数据|不修改数据|先别修改|仅分析|只分析|先分析|只做分析|不要生成可执行)/.test(text);
+  const analysisOnly = /(只给方案|先给方案|仅给方案|先不要修改|不要修改任何数据|不要修改数据|不修改数据|先别修改|仅分析|只分析|先分析|只做分析|不要生成可执行|不生成预览|不要生成预览|不用生成预览|不做预览|不要预览|先别生成预览|暂不生成预览)/.test(text);
+  const explicitNoPreview = /(?:不生成预览|不要生成预览|不用生成预览|不做预览|不要预览|先别生成预览|暂不生成预览|不需要预览)/.test(text);
+  const explicitPrepare = /(?:生成|做|创建|准备|给出|给我).{0,16}(?:变更|整理|操作)?预览|预览.{0,12}(?:变更|修改|操作)|生成.{0,16}actions?/i.test(text);
 
   if (explicitNoPreview) return 'analysis_only';
-
-  const mentionsPreview = /预览/.test(text);
-  const prepareChanges = mentionsPreview ||
-    /(生成|准备|列出|给出|给我).{0,30}(待确认变更|可执行变更|操作清单)|生成.{0,16}actions?/i.test(text);
-  if (prepareChanges) return 'prepare_changes';
-
+  if (analysisOnly && !explicitPrepare) return 'analysis_only';
+  if (explicitPrepare) return 'prepare_changes';
   if (analysisOnly) return 'analysis_only';
   return 'normal';
 }
@@ -105,13 +102,27 @@ function statisticalInterpretationHint(message) {
   return '【统计口径提示】本句中的“数字/数字/数字”表示用户期望核对的统计值，不是分类 ID。只有用户明确写“分类ID/ID为”时才按分类 ID 读取。';
 }
 
-function buildForwardMessage(originalMessage, previousHistory, mode, tasks) {
+function mappingAuditHint(items) {
+  const mismatches = (Array.isArray(items) ? items : []).filter(item => item.status !== 'match');
+  if (!mismatches.length) return '';
+  const lines = mismatches.map(item => {
+    const requested = `分类${item.requestedId}「${item.requestedName}」`;
+    const database = item.databaseName ? `分类${item.requestedId}「${item.databaseName}」` : `分类${item.requestedId}（不存在）`;
+    const corrected = item.correctedId ? `分类${item.correctedId}「${item.correctedName}」` : '未找到同名分类';
+    return `${requested} 与数据库不一致；数据库实际=${database}；按名称解析=${corrected}`;
+  });
+  return `【输入分类映射预检】\n${lines.join('\n')}\n如果用户的意图以分类名称为准，必须使用“按名称解析”的真实分类 ID；不得继续使用错误的 ID/名称组合。`;
+}
+
+function buildForwardMessage(originalMessage, previousHistory, mode, tasks, inputScopeAudit = []) {
   const original = String(originalMessage || '').trim().slice(0, 1800);
   const memory = compactOlderMemory(previousHistory);
   const taskIndex = compactTaskIndex(tasks);
   const parts = [original, modeInstruction(mode)];
   const statsHint = statisticalInterpretationHint(original);
   if (statsHint) parts.push(statsHint);
+  const mappingHint = mappingAuditHint(inputScopeAudit);
+  if (mappingHint) parts.push(mappingHint);
 
   if (taskIndex) {
     parts.push(`【本会话稳定任务索引】\n${taskIndex}\n解释序数指代时：用户说“第一个任务/第一条结果/刚才第一条结果”时，优先按这里的任务序号理解；只有明确说“匹配结果里的第一个/搜索结果第一个”时，才按最近匹配卡片排序理解。若仍有歧义，应先追问，不要擅自选择对象。`);
@@ -120,7 +131,7 @@ function buildForwardMessage(originalMessage, previousHistory, mode, tasks) {
   if (memory) {
     parts.push(`【较早的同一会话记忆，仅用于理解“刚才、之前、那些、第一个”等指代；若与当前数据库状态冲突，以重新调用工具读取的数据为准】\n${memory}`);
   }
-  return parts.join('\n\n').slice(0, 5600);
+  return parts.join('\n\n').slice(0, 6000);
 }
 
 function buildPrepareRetryMessage(originalMessage, validationErrors = []) {
@@ -161,8 +172,12 @@ function applyResponseSafety(responseData, mode) {
     const removed = responseData.data.actions.length;
     responseData.data.actions = [];
     responseData.data.writePreviewSuppressed = removed > 0;
+    responseData.data.pendingWriteAllowed = false;
+    if (responseData.data.plan && typeof responseData.data.plan === 'object') {
+      responseData.data.plan.estimatedChanges = 0;
+    }
     if (removed > 0) {
-      responseData.data.reply = `${responseData.data.reply}\n\n（已按“只给方案”模式隐藏 ${removed} 项可执行变更；如需生成待确认预览，请明确说“生成变更预览”。）`;
+      responseData.data.reply = `${responseData.data.reply}\n\n（已按“只给方案”模式强制清除 ${removed} 项可执行变更；本轮不会显示确认执行。如需生成待确认预览，请明确说“生成变更预览”。）`;
     }
   }
   return responseData;
@@ -172,9 +187,52 @@ function normalizeEstimatedText(value, actionCount) {
   return String(value || '').replace(/(预计(?:变更)?\s*[:：]?\s*(?:约\s*)?)\d+\s*项/g, `$1${actionCount} 项`);
 }
 
+function scopeRefPattern() {
+  return /分类\s*#?\s*(\d+)\s*[「『“"【]([^」』”"】]+)[」』”"】]/g;
+}
+
+async function buildInputScopeAudit(message, env) {
+  if (!env.NAV_DB) return [];
+  const text = String(message || '');
+  const matches = [];
+  const pattern = scopeRefPattern();
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    matches.push({
+      requestedId: Number.parseInt(match[1], 10),
+      requestedName: String(match[2] || '').trim(),
+    });
+  }
+  if (!matches.length) return [];
+
+  try {
+    const { results } = await env.NAV_DB.prepare('SELECT id, catelog FROM category ORDER BY id').all();
+    const rows = results || [];
+    const byId = new Map(rows.map(row => [Number(row.id), String(row.catelog || '')]));
+    const byName = new Map();
+    for (const row of rows) {
+      const name = String(row.catelog || '').trim();
+      if (name && !byName.has(name)) byName.set(name, Number(row.id));
+    }
+
+    return matches.map(item => {
+      const databaseName = byId.get(item.requestedId) || '';
+      const correctedId = databaseName === item.requestedName ? item.requestedId : (byName.get(item.requestedName) || 0);
+      const correctedName = correctedId ? (byId.get(correctedId) || item.requestedName) : '';
+      let status = 'match';
+      if (!databaseName) status = 'missing_id';
+      else if (databaseName !== item.requestedName) status = correctedId ? 'corrected' : 'mismatch';
+      return { ...item, databaseName, correctedId, correctedName, status };
+    });
+  } catch (error) {
+    console.warn('Failed to preflight input category mappings:', error);
+    return [];
+  }
+}
+
 function normalizeScopeRefs(scope, categoryMap, validationErrors) {
   const refs = [];
-  const pattern = /分类\s*#?\s*(\d+)\s*[「『“"【]([^」』”"】]+)[」』”"】]/g;
+  const pattern = scopeRefPattern();
   const normalized = String(scope || '').replace(pattern, (full, rawId, claimedName) => {
     const id = Number.parseInt(rawId, 10);
     const claimed = String(claimedName || '').trim();
@@ -193,7 +251,17 @@ function normalizeScopeRefs(scope, categoryMap, validationErrors) {
   return { normalized, refs };
 }
 
-async function validatePreparedPreview(responseData, env) {
+function inputAuditErrors(inputScopeAudit) {
+  return (Array.isArray(inputScopeAudit) ? inputScopeAudit : [])
+    .filter(item => item.status !== 'match')
+    .map(item => {
+      const database = item.databaseName ? `分类${item.requestedId}「${item.databaseName}」` : `分类${item.requestedId}不存在`;
+      const corrected = item.correctedId ? `；按名称应为分类${item.correctedId}「${item.correctedName}」` : '';
+      return `用户输入分类映射不一致：分类${item.requestedId}「${item.requestedName}」；数据库实际为${database}${corrected}`;
+    });
+}
+
+async function validatePreparedPreview(responseData, env, inputScopeAudit = [], enforceInputAudit = false) {
   if (!responseData?.data || responseData.data.mode !== 'prepare_changes' || !env.NAV_DB) return responseData;
 
   const data = responseData.data;
@@ -201,7 +269,7 @@ async function validatePreparedPreview(responseData, env) {
 
   const { results } = await env.NAV_DB.prepare('SELECT id, catelog FROM category ORDER BY id').all();
   const categoryMap = new Map((results || []).map(row => [Number(row.id), String(row.catelog || '')]));
-  const validationErrors = [];
+  const validationErrors = enforceInputAudit ? inputAuditErrors(inputScopeAudit) : [];
   let planScopeRefs = [];
 
   if (data.plan && typeof data.plan === 'object') {
@@ -285,11 +353,19 @@ function snapshotPrepareAttempt(responseData, attempt) {
   };
 }
 
-function appendPrepareAudit(responseData, attempts, retryUsed) {
+function appendPrepareAudit(responseData, attempts, retryUsed, inputScopeAudit = []) {
   if (!responseData?.data || responseData.data.mode !== 'prepare_changes') return;
   const data = responseData.data;
   const actions = Array.isArray(data.actions) ? data.actions : [];
   const toolsUsed = Array.isArray(data.toolsUsed) ? [...data.toolsUsed] : [];
+
+  const mappingIssues = (Array.isArray(inputScopeAudit) ? inputScopeAudit : []).filter(item => item.status !== 'match');
+  for (const item of mappingIssues) {
+    const requested = `分类${item.requestedId}「${item.requestedName}」`;
+    const database = item.databaseName ? `分类${item.requestedId}「${item.databaseName}」` : `分类${item.requestedId}（不存在）`;
+    const corrected = item.correctedId ? `分类${item.correctedId}「${item.correctedName}」` : '未找到同名分类';
+    toolsUsed.push(`scope 映射预检：requested=${requested}；database=${database}；corrected=${corrected}；status=${item.status}`);
+  }
 
   for (const item of attempts) {
     const errors = item.errors.length ? `；errors=${item.errors.join(' | ')}` : '';
@@ -297,7 +373,8 @@ function appendPrepareAudit(responseData, attempts, retryUsed) {
   }
 
   const everBlocked = attempts.some(item => item.blocked);
-  toolsUsed.push(`prepare 最终：attempt=${attempts.length || 1}；retry=${retryUsed ? 'yes' : 'no'}；actionCount=${actions.length}；blocked=${data.prepareValidationBlocked ? 'yes' : 'no'}；everBlocked=${everBlocked ? 'yes' : 'no'}`);
+  const scopeMappingCorrected = mappingIssues.some(item => item.correctedId > 0);
+  toolsUsed.push(`prepare 最终：attempt=${attempts.length || 1}；retry=${retryUsed ? 'yes' : 'no'}；actionCount=${actions.length}；blocked=${data.prepareValidationBlocked ? 'yes' : 'no'}；everBlocked=${everBlocked ? 'yes' : 'no'}；scopeMappingCorrected=${scopeMappingCorrected ? 'yes' : 'no'}`);
 
   data.toolsUsed = toolsUsed;
   data.prepareAttempt = attempts.length || 1;
@@ -305,9 +382,13 @@ function appendPrepareAudit(responseData, attempts, retryUsed) {
   data.prepareFinalActionCount = actions.length;
   data.prepareValidationEverBlocked = everBlocked;
   data.prepareValidationHistory = attempts;
+  data.scopeMappingAudit = inputScopeAudit;
+  data.scopeMappingCorrected = scopeMappingCorrected;
 
   if (everBlocked && actions.length > 0) {
     data.reply = `首次变更预览未通过安全校验，系统已自动重试并重新校验通过。\n\n${data.reply}`;
+  } else if (scopeMappingCorrected) {
+    data.reply = `检测到原始分类 ID/名称映射不一致，系统已按数据库真实映射记录并校验。\n\n${data.reply}`;
   }
 }
 
@@ -350,13 +431,14 @@ export async function onRequestPost(context) {
   if (!originalMessage || !sessionId) return runAgentChat(context);
 
   const mode = detectRequestMode(originalMessage);
+  const inputScopeAudit = mode === 'prepare_changes' ? await buildInputScopeAudit(originalMessage, env) : [];
   const before = await loadRawSession(env, sessionId);
   const previousHistory = cleanHistory(before?.history).slice(-MAX_PERSISTED_MESSAGES);
   const previousTasks = cleanTasks(before?.tasks);
   const forwardedBody = {
     ...body,
     requestMode: mode,
-    message: buildForwardMessage(originalMessage, previousHistory, mode, previousTasks),
+    message: buildForwardMessage(originalMessage, previousHistory, mode, previousTasks, inputScopeAudit),
   };
 
   let response = await runAgentChat({ ...context, request: buildAgentRequest(request, forwardedBody) });
@@ -364,7 +446,7 @@ export async function onRequestPost(context) {
 
   try {
     let responseData = await parseAgentResponse(response, mode);
-    responseData = await validatePreparedPreview(responseData, env);
+    responseData = await validatePreparedPreview(responseData, env, inputScopeAudit, true);
 
     let prepareRetryUsed = false;
     const prepareAttempts = [];
@@ -388,20 +470,21 @@ export async function onRequestPost(context) {
           previousHistory,
           mode,
           previousTasks,
+          inputScopeAudit,
         ),
       };
       const retryResponse = await runAgentChat({ ...context, request: buildAgentRequest(request, retryBody) });
       if (retryResponse.ok) {
         response = retryResponse;
         responseData = await parseAgentResponse(retryResponse, mode);
-        responseData = await validatePreparedPreview(responseData, env);
+        responseData = await validatePreparedPreview(responseData, env, inputScopeAudit, false);
         prepareAttempts.push(snapshotPrepareAttempt(responseData, 2));
       }
     }
 
     if (responseData?.data) {
       responseData = ensureTruthfulPrepareResponse(responseData);
-      appendPrepareAudit(responseData, prepareAttempts, prepareRetryUsed);
+      appendPrepareAudit(responseData, prepareAttempts, prepareRetryUsed, inputScopeAudit);
     }
 
     if (response.ok && responseData?.code === 200 && responseData?.data?.reply) {
