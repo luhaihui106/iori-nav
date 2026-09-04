@@ -20,12 +20,22 @@
     document.body.appendChild(script);
   }
 
+  function loadAssistantWindowScript() {
+    loadScript(
+      '/js/admin-assistant-window.js',
+      'data-iori-assistant-window',
+      () => Boolean(window.IoriAssistantWindow),
+      'AI assistant window enhancement'
+    );
+  }
+
   function loadAssistantScript() {
     loadScript(
       '/js/admin-assistant.js',
       'data-iori-assistant',
       () => Boolean(window.IoriAdminAssistant),
-      'AI assistant script'
+      'AI assistant script',
+      loadAssistantWindowScript
     );
   }
 
