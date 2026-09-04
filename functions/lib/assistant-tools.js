@@ -36,10 +36,8 @@ function normalizeSearchTerms(query) {
   const terms = [];
   for (const part of text.split(' ')) {
     if (!part) continue;
-
     const ascii = part.match(/[a-z0-9._:/-]{2,40}/gi) || [];
     terms.push(...ascii);
-
     const chinese = part.match(/[\u4e00-\u9fff]{2,8}/g) || [];
     for (const item of chinese) {
       if (!stopWords.has(item)) terms.push(item);
@@ -59,18 +57,96 @@ async function libraryStats(db) {
         COUNT(DISTINCT LOWER(TRIM(url))) AS unique_urls
       FROM sites
     `).first(),
-    db.prepare('SELECT COUNT(*) AS total FROM category').first(),
+    db.prepare(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN COALESCE(parent_id, 0) = 0 THEN 1 ELSE 0 END) AS top_level
+      FROM category
+    `).first(),
   ]);
 
   const total = Number(siteStats?.total || 0);
   const uniqueUrls = Number(siteStats?.unique_urls || 0);
+  const totalCategories = Number(categoryStats?.total || 0);
+  const topLevelCategories = Number(categoryStats?.top_level || 0);
   return {
     totalBookmarks: total,
-    totalCategories: Number(categoryStats?.total || 0),
+    totalCategories,
+    topLevelCategories,
+    nestedCategories: Math.max(0, totalCategories - topLevelCategories),
     privateBookmarks: Number(siteStats?.private_count || 0),
     bookmarksWithoutDescription: Number(siteStats?.no_desc_count || 0),
     duplicateUrlCountEstimate: Math.max(0, total - uniqueUrls),
   };
+}
+
+function buildCategoryTreeStats(rows) {
+  const rowMap = new Map();
+  const children = new Map();
+
+  for (const row of rows) {
+    const id = Number(row.id);
+    const parentId = Number(row.parent_id) || 0;
+    rowMap.set(id, {
+      id,
+      name: row.catelog || '',
+      parentId,
+      sortOrder: Number(row.sort_order || 0),
+      private: Number(row.is_private) === 1,
+      directCount: Number(row.site_count || 0),
+    });
+    if (!children.has(parentId)) children.set(parentId, []);
+    children.get(parentId).push(id);
+  }
+
+  const memo = new Map();
+  function stats(id, stack = new Set()) {
+    if (memo.has(id)) return memo.get(id);
+    if (stack.has(id)) return { recursiveCount: rowMap.get(id)?.directCount || 0, descendantIds: [] };
+    stack.add(id);
+    const row = rowMap.get(id);
+    const childIds = children.get(id) || [];
+    let recursiveCount = row?.directCount || 0;
+    const descendantIds = [];
+    for (const childId of childIds) {
+      descendantIds.push(childId);
+      const childStats = stats(childId, new Set(stack));
+      recursiveCount += childStats.recursiveCount;
+      descendantIds.push(...childStats.descendantIds);
+    }
+    const result = { recursiveCount, descendantIds };
+    memo.set(id, result);
+    return result;
+  }
+
+  function depthOf(id) {
+    let depth = 0;
+    let current = rowMap.get(id);
+    const seen = new Set();
+    while (current?.parentId && !seen.has(current.parentId)) {
+      seen.add(current.parentId);
+      depth++;
+      current = rowMap.get(current.parentId);
+    }
+    return depth;
+  }
+
+  return [...rowMap.values()].map(row => {
+    const computed = stats(row.id);
+    return {
+      id: row.id,
+      name: row.name,
+      parentId: row.parentId,
+      parentName: row.parentId ? (rowMap.get(row.parentId)?.name || '') : '',
+      depth: depthOf(row.id),
+      childCount: (children.get(row.id) || []).length,
+      count: row.directCount,
+      directCount: row.directCount,
+      recursiveCount: computed.recursiveCount,
+      descendantCount: computed.descendantIds.length,
+      private: row.private,
+    };
+  });
 }
 
 async function listCategories(db) {
@@ -81,20 +157,30 @@ async function listCategories(db) {
     GROUP BY c.id, c.catelog, c.parent_id, c.sort_order, c.is_private
     ORDER BY c.sort_order ASC, c.id ASC
   `).all();
+  return buildCategoryTreeStats(results || []);
+}
+
+async function getCategoryScope(db, categoryId) {
+  const { results } = await db.prepare(`
+    WITH RECURSIVE scope(id, catelog, parent_id, depth) AS (
+      SELECT id, catelog, parent_id, 0 FROM category WHERE id = ?
+      UNION ALL
+      SELECT c.id, c.catelog, c.parent_id, scope.depth + 1
+      FROM category c
+      JOIN scope ON c.parent_id = scope.id
+    )
+    SELECT id, catelog, parent_id, depth FROM scope ORDER BY depth, id
+  `).bind(categoryId).all();
 
   const rows = results || [];
-  const nameMap = new Map(rows.map(row => [Number(row.id), row.catelog]));
-  return rows.map(row => {
-    const parentId = Number(row.parent_id) || 0;
-    return {
-      id: Number(row.id),
-      name: row.catelog || '',
-      parentId,
-      parentName: parentId ? (nameMap.get(parentId) || '') : '',
-      count: Number(row.site_count || 0),
-      private: Number(row.is_private) === 1,
-    };
-  });
+  if (!rows.length) return null;
+  return {
+    requestedId: categoryId,
+    requestedName: rows[0].catelog || '',
+    includedIds: rows.map(row => Number(row.id)),
+    descendantIds: rows.slice(1).map(row => Number(row.id)),
+    descendantCount: Math.max(0, rows.length - 1),
+  };
 }
 
 async function listBookmarks(db, args = {}) {
@@ -103,34 +189,88 @@ async function listBookmarks(db, args = {}) {
   const offset = (page - 1) * pageSize;
   const categoryId = Number.parseInt(args.categoryId, 10);
   const hasCategory = Number.isFinite(categoryId) && categoryId > 0;
+  const includeDescendants = hasCategory ? args.includeDescendants !== false : false;
 
-  const where = hasCategory ? 'WHERE catelog_id = ?' : '';
-  const countQuery = hasCategory
-    ? db.prepare('SELECT COUNT(*) AS total FROM sites WHERE catelog_id = ?').bind(categoryId)
-    : db.prepare('SELECT COUNT(*) AS total FROM sites');
-  const dataQuery = hasCategory
-    ? db.prepare(`
-        SELECT id, name, url, desc, catelog_id, catelog_name, is_private
-        FROM sites ${where}
-        ORDER BY sort_order ASC, update_time DESC, id DESC
-        LIMIT ? OFFSET ?
-      `).bind(categoryId, pageSize, offset)
-    : db.prepare(`
-        SELECT id, name, url, desc, catelog_id, catelog_name, is_private
-        FROM sites
-        ORDER BY sort_order ASC, update_time DESC, id DESC
-        LIMIT ? OFFSET ?
-      `).bind(pageSize, offset);
+  let countQuery;
+  let dataQuery;
+  let categoryScope = null;
+
+  if (hasCategory && includeDescendants) {
+    categoryScope = await getCategoryScope(db, categoryId);
+    if (!categoryScope) {
+      return {
+        page: 0,
+        pageSize,
+        total: 0,
+        totalPages: 0,
+        hasMore: false,
+        complete: true,
+        categoryScope: null,
+        bookmarks: [],
+      };
+    }
+
+    countQuery = db.prepare(`
+      WITH RECURSIVE scope(id) AS (
+        SELECT id FROM category WHERE id = ?
+        UNION ALL
+        SELECT c.id FROM category c JOIN scope ON c.parent_id = scope.id
+      )
+      SELECT COUNT(*) AS total FROM sites WHERE catelog_id IN (SELECT id FROM scope)
+    `).bind(categoryId);
+
+    dataQuery = db.prepare(`
+      WITH RECURSIVE scope(id) AS (
+        SELECT id FROM category WHERE id = ?
+        UNION ALL
+        SELECT c.id FROM category c JOIN scope ON c.parent_id = scope.id
+      )
+      SELECT id, name, url, desc, catelog_id, catelog_name, is_private
+      FROM sites
+      WHERE catelog_id IN (SELECT id FROM scope)
+      ORDER BY sort_order ASC, update_time DESC, id DESC
+      LIMIT ? OFFSET ?
+    `).bind(categoryId, pageSize, offset);
+  } else if (hasCategory) {
+    countQuery = db.prepare('SELECT COUNT(*) AS total FROM sites WHERE catelog_id = ?').bind(categoryId);
+    dataQuery = db.prepare(`
+      SELECT id, name, url, desc, catelog_id, catelog_name, is_private
+      FROM sites WHERE catelog_id = ?
+      ORDER BY sort_order ASC, update_time DESC, id DESC
+      LIMIT ? OFFSET ?
+    `).bind(categoryId, pageSize, offset);
+    categoryScope = await getCategoryScope(db, categoryId);
+  } else {
+    countQuery = db.prepare('SELECT COUNT(*) AS total FROM sites');
+    dataQuery = db.prepare(`
+      SELECT id, name, url, desc, catelog_id, catelog_name, is_private
+      FROM sites
+      ORDER BY sort_order ASC, update_time DESC, id DESC
+      LIMIT ? OFFSET ?
+    `).bind(pageSize, offset);
+  }
 
   const [count, data] = await Promise.all([countQuery.first(), dataQuery.all()]);
   const total = Number(count?.total || 0);
+  const totalPages = total === 0 ? 0 : Math.ceil(total / pageSize);
+  const bookmarks = (data.results || []).map(compactBookmark);
+  const hasMore = offset + bookmarks.length < total;
+
   return {
-    page,
+    page: total === 0 ? 0 : page,
     pageSize,
     total,
-    totalPages: Math.max(1, Math.ceil(total / pageSize)),
-    hasMore: offset + pageSize < total,
-    bookmarks: (data.results || []).map(compactBookmark),
+    expectedTotal: total,
+    actualPageCount: bookmarks.length,
+    totalPages,
+    hasMore,
+    complete: total === 0 || (!hasMore && page >= totalPages),
+    includeDescendants,
+    categoryScope: categoryScope ? {
+      ...categoryScope,
+      expectedTotal: total,
+    } : null,
+    bookmarks,
   };
 }
 
@@ -220,9 +360,9 @@ async function findDuplicates(db, args = {}) {
 export const ASSISTANT_TOOL_GUIDE = `
 你可以通过 JSON 请求后端工具读取真实书签数据。不要假设数据库内容。
 可用工具：
-1. library_stats {}：获取书签总数、分类数、无描述数量、重复 URL 估算。
-2. list_categories {}：读取全部分类、父子关系和每个分类的书签数量。
-3. list_bookmarks {"page":1,"pageSize":80,"categoryId":可选}：分页读取书签，pageSize 最大 120。
+1. library_stats {}：获取书签总数、全部分类数、顶级分类数、二级及以下分类数、无描述数量、重复 URL 估算。
+2. list_categories {}：读取全部分类、父子关系、直接书签数 directCount、递归书签数 recursiveCount、子分类数 childCount。
+3. list_bookmarks {"page":1,"pageSize":120,"categoryId":可选,"includeDescendants":可选}：分页读取书签，pageSize 最大 120。传 categoryId 时默认 includeDescendants=true，即父分类会自动包含全部后代分类；只有用户明确要求“仅本级”时才设为 false。
 4. search_bookmarks {"query":"自然语言关键词","limit":40}：在名称、URL、描述、分类中做字面检索。
 5. get_bookmarks {"ids":[1,2,3]}：按 ID 读取书签详情。
 6. find_duplicates {"limit":20}：查找完全相同 URL 的重复收藏。
@@ -230,7 +370,11 @@ export const ASSISTANT_TOOL_GUIDE = `
 需要工具时严格返回：
 {"type":"tool_calls","calls":[{"name":"library_stats","arguments":{}},{"name":"list_categories","arguments":{}}]}
 一次最多请求 6 个工具。收到 TOOL_RESULTS 后继续思考；如果还有必要继续读取，继续请求工具。
-当用户要求分析“全部/所有/整个书签库”时，必须先调用 library_stats 和 list_categories；随后按页调用 list_bookmarks，直到覆盖全部书签，或明确告诉用户本轮只完成了部分扫描。不要把局部候选冒充全库分析。
+
+完整性规则：
+- 当用户要求分析“全部/所有/整个书签库”时，必须先调用 library_stats 和 list_categories；随后按页调用 list_bookmarks，直到读取数等于 totalBookmarks。
+- 当用户要求分析某个父分类时，先从 list_categories 确认它的 recursiveCount，再调用 list_bookmarks(categoryId=该分类ID, includeDescendants=true)。工具会返回 categoryScope.expectedTotal。若 expectedTotal 与实际已读取数量不一致，不得声称“全部覆盖”，也不得生成批量写入方案。
+- 父分类下即使本级 0 条，只要子分类有书签，就不能判断为空。
 `;
 
 export async function executeAssistantTool(env, name, args = {}) {
