@@ -1,4 +1,4 @@
-const CODE_REVISION = 'assistant-r5-final-guard-20260904';
+const CODE_REVISION = 'assistant-r6-audit-safety-20260904';
 
 export async function onRequestGet(context) {
   const { env } = context;
