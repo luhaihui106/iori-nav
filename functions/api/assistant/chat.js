@@ -1,7 +1,7 @@
 import { isAdminAuthenticated, errorResponse, jsonResponse } from '../../_middleware';
 import { resolveWorkersAiModel } from '../../lib/workers-ai-models';
 
-const MAX_CANDIDATES = 80;
+const MAX_CANDIDATES = 120;
 const MAX_ACTIONS = 100;
 
 function normalizeText(value, max = 200) {
@@ -23,35 +23,75 @@ function extractJson(text) {
   return null;
 }
 
+function isBroadScopeQuery(message) {
+  return /(全部|所有|全量|整体|目前所有|当前所有|整个|重新整理|重新分类|整体整理|整体分类)/.test(String(message || ''));
+}
+
 function tokenizeQuery(message) {
-  return [...new Set(String(message || '')
+  const text = String(message || '')
     .toLowerCase()
     .replace(/[，。！？、；：,.!?;:()（）\[\]【】"'“”‘’]/g, ' ')
-    .split(/\s+/)
-    .flatMap(part => part.length > 4 && /[\u4e00-\u9fff]/.test(part)
-      ? [part, ...part.match(/[\u4e00-\u9fff]{2,4}/g) || []]
-      : [part])
-    .map(v => v.trim())
-    .filter(v => v.length >= 2)
-    .slice(0, 12))];
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const stopWords = new Set([
+    '帮我', '一下', '进行', '目前', '当前', '所有', '全部', '有些', '还有', '可能',
+    '就是', '比较', '不太', '合适', '你能', '分析', '整理', '分类', '重新', '网站', '网址',
+    '收藏', '书签', '页面', '命名', '分组', '完全', '访问', '正式', '现在', '我的', '可以',
+  ]);
+
+  const tokens = [];
+  for (const part of text.split(' ')) {
+    if (!part) continue;
+
+    if (/^[a-z0-9._:/-]+$/i.test(part)) {
+      if (part.length >= 2 && part.length <= 32) tokens.push(part);
+      continue;
+    }
+
+    const chineseParts = part.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+    for (const chunk of chineseParts) {
+      if (!stopWords.has(chunk) && chunk.length <= 12) tokens.push(chunk);
+    }
+
+    const asciiParts = part.match(/[a-z0-9._-]{2,32}/gi) || [];
+    tokens.push(...asciiParts);
+  }
+
+  return [...new Set(tokens.map(v => v.trim()).filter(v => v.length >= 2 && v.length <= 32))].slice(0, 8);
+}
+
+async function loadRecentCandidates(db, limit = MAX_CANDIDATES) {
+  const { results } = await db.prepare(`
+    SELECT id, name, url, desc, catelog_id, catelog_name, is_private, update_time
+    FROM sites ORDER BY update_time DESC, id DESC LIMIT ?
+  `).bind(limit).all();
+  return results || [];
 }
 
 async function loadCandidates(db, message) {
-  const tokens = tokenizeQuery(message);
-  if (!tokens.length) {
-    const { results } = await db.prepare(`
-      SELECT id, name, url, desc, catelog_id, catelog_name, is_private, update_time
-      FROM sites ORDER BY update_time DESC, id DESC LIMIT ?
-    `).bind(MAX_CANDIDATES).all();
-    return results || [];
+  if (isBroadScopeQuery(message)) {
+    return loadRecentCandidates(db);
   }
 
+  const tokens = tokenizeQuery(message);
+  if (!tokens.length) {
+    return loadRecentCandidates(db);
+  }
+
+  // 不使用 LIKE/GLOB。Cloudflare D1/SQLite 对复杂 LIKE pattern 有复杂度限制，
+  // 长中文自然语言指令可能触发 "LIKE or GLOB pattern too complex"。
+  // INSTR 做字面子串匹配，不把用户输入解释为 pattern，也避免 %/_ 通配符问题。
   const clauses = [];
   const params = [];
-  for (const token of tokens.slice(0, 8)) {
-    const like = `%${token}%`;
-    clauses.push('(LOWER(name) LIKE ? OR LOWER(url) LIKE ? OR LOWER(COALESCE(desc,\'\')) LIKE ? OR LOWER(COALESCE(catelog_name,\'\')) LIKE ?)');
-    params.push(like, like, like, like);
+  for (const token of tokens.slice(0, 6)) {
+    clauses.push(`(
+      INSTR(LOWER(COALESCE(name, '')), ?) > 0 OR
+      INSTR(LOWER(COALESCE(url, '')), ?) > 0 OR
+      INSTR(LOWER(COALESCE(desc, '')), ?) > 0 OR
+      INSTR(LOWER(COALESCE(catelog_name, '')), ?) > 0
+    )`);
+    params.push(token, token, token, token);
   }
 
   const sql = `
@@ -66,11 +106,8 @@ async function loadCandidates(db, message) {
 
   if ((results || []).length >= 8) return results || [];
 
-  const { results: fallback } = await db.prepare(`
-    SELECT id, name, url, desc, catelog_id, catelog_name, is_private, update_time
-    FROM sites ORDER BY update_time DESC, id DESC LIMIT ?
-  `).bind(MAX_CANDIDATES).all();
-  return fallback || [];
+  // 模糊描述没有足够命中时，让 AI 从近期候选中二次判断，而不是直接返回空结果。
+  return loadRecentCandidates(db);
 }
 
 async function loadAiSettings(db) {
@@ -202,6 +239,7 @@ export async function onRequestPost(context) {
     const system = `你是 iori-nav 的 AI 书签助手。你只能基于提供的书签和分类工作。\n` +
       `职责：1) 根据模糊描述找出用户想找的网站；2) 对书签提出重命名、修改描述、移动分类建议；3) 不得编造不存在的书签或分类。\n` +
       `如果用户只是查找网站，actions 必须为空。只有用户明确要求修改、整理、重命名、重新分类时才生成 actions。\n` +
+      `当用户要求整体整理时，应先指出当前版本只能基于提供的候选和现有分类提出修改，不要声称已经分析了数据库中未提供的记录。\n` +
       `绝不能删除书签、删除分类或执行 SQL。\n` +
       `严格只返回 JSON：{"reply":"中文回复","results":[{"id":1,"reason":"匹配原因"}],"actions":[{"type":"rename_bookmark","siteId":1,"name":"新名称"},{"type":"update_description","siteId":1,"description":"新描述"},{"type":"move_bookmark","siteId":1,"categoryId":2}]}。`;
 
