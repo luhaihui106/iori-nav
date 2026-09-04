@@ -19,12 +19,12 @@
     const total = Number.parseInt(totalPages.textContent || '0', 10) || 0;
     const hasCards = Boolean(grid.querySelector('.site-card'));
     if (total === 0 && !hasCards) {
-      currentPage.textContent = '0';
-      totalPages.textContent = '0';
+      if (currentPage.textContent !== '0') currentPage.textContent = '0';
+      if (totalPages.textContent !== '0') totalPages.textContent = '0';
       const prev = document.getElementById('prevPage');
       const next = document.getElementById('nextPage');
-      if (prev) prev.disabled = true;
-      if (next) next.disabled = true;
+      if (prev && !prev.disabled) prev.disabled = true;
+      if (next && !next.disabled) next.disabled = true;
     }
   }
 
