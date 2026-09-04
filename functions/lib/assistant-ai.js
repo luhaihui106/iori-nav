@@ -1,6 +1,7 @@
 import { resolveWorkersAiModel } from './workers-ai-models';
 
 const DEFAULT_AI_TIMEOUT_MS = 40000;
+const DEFAULT_FALLBACK_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 
 export function stripAssistantJsonFence(text) {
   return String(text || '')
@@ -14,34 +15,36 @@ export function parseAssistantJson(text) {
   const clean = stripAssistantJsonFence(text);
   try {
     return JSON.parse(clean);
-  } catch {
-    // 兼容模型在 JSON 前后附带少量解释文本的情况。
-  }
+  } catch {}
 
   const firstObject = clean.indexOf('{');
   const lastObject = clean.lastIndexOf('}');
   if (firstObject >= 0 && lastObject > firstObject) {
     try {
       return JSON.parse(clean.slice(firstObject, lastObject + 1));
-    } catch {
-      // fall through
-    }
+    } catch {}
   }
-
   return null;
 }
 
 export async function loadAssistantAiSettings(db) {
-  const keys = ['provider', 'apiKey', 'baseUrl', 'model'];
+  const keys = [
+    'provider', 'apiKey', 'baseUrl', 'model',
+    'ai_fallback_enabled', 'ai_fallback_provider', 'ai_fallback_model',
+    'ai_fallback_on_timeout', 'ai_fallback_on_5xx', 'ai_fallback_on_empty', 'ai_fallback_on_format'
+  ];
   const { results } = await db.prepare(
     `SELECT key, value FROM settings WHERE key IN (${keys.map(() => '?').join(',')})`
   ).bind(...keys).all();
 
   const settings = {};
-  for (const row of results || []) {
-    settings[row.key] = row.value;
-  }
+  for (const row of results || []) settings[row.key] = row.value;
   return settings;
+}
+
+export function settingEnabled(value, defaultValue = true) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  return value === true || value === 1 || value === '1' || value === 'true';
 }
 
 function stringifyStructuredContent(value) {
@@ -56,11 +59,8 @@ function stringifyStructuredContent(value) {
 
 function getMessageContentText(content) {
   if (typeof content === 'string') return content;
-  if (content && !Array.isArray(content) && typeof content === 'object') {
-    return stringifyStructuredContent(content);
-  }
+  if (content && !Array.isArray(content) && typeof content === 'object') return stringifyStructuredContent(content);
   if (!Array.isArray(content)) return '';
-
   return content.map(part => {
     if (typeof part === 'string') return part;
     if (typeof part?.text === 'string') return part.text;
@@ -72,46 +72,32 @@ function getMessageContentText(content) {
 function extractWorkersAiText(response) {
   if (typeof response === 'string') return response;
   if (!response || typeof response !== 'object') return '';
-
   if (typeof response.response === 'string') return response.response;
   if (response.response && typeof response.response === 'object') {
     const structured = stringifyStructuredContent(response.response);
     if (structured) return structured;
   }
-
-  const choiceMessage = response.choices?.[0]?.message;
-  const choice = getMessageContentText(choiceMessage?.content);
+  const choice = getMessageContentText(response.choices?.[0]?.message?.content);
   if (choice) return choice;
-
   const candidates = [
-    response.output_text,
-    response.generated_text,
-    response.text,
-    response.result?.response,
-    response.result?.output_text,
-    response.result?.generated_text,
-    response.result?.text,
-    response.result?.choices?.[0]?.message?.content,
+    response.output_text, response.generated_text, response.text,
+    response.result?.response, response.result?.output_text, response.result?.generated_text,
+    response.result?.text, response.result?.choices?.[0]?.message?.content,
     response.output?.[0]?.content,
   ];
   for (const candidate of candidates) {
     const text = getMessageContentText(candidate);
     if (text) return text;
   }
-
   return '';
 }
 
 function extractOpenAiText(data) {
   const direct = getMessageContentText(data?.choices?.[0]?.message?.content);
   if (direct) return direct;
-
   const candidates = [
-    data?.output_text,
-    data?.response,
-    data?.result?.choices?.[0]?.message?.content,
-    data?.result?.output_text,
-    data?.data?.choices?.[0]?.message?.content,
+    data?.output_text, data?.response, data?.result?.choices?.[0]?.message?.content,
+    data?.result?.output_text, data?.data?.choices?.[0]?.message?.content,
   ];
   for (const candidate of candidates) {
     const text = getMessageContentText(candidate);
@@ -125,10 +111,8 @@ function describeWorkersAiResponse(response) {
   const keys = Object.keys(response).slice(0, 12).join(',');
   const finishReason = response.choices?.[0]?.finish_reason || response.result?.choices?.[0]?.finish_reason || '';
   const hasReasoning = Boolean(
-    response.choices?.[0]?.message?.reasoning ||
-    response.choices?.[0]?.message?.reasoning_content ||
-    response.result?.choices?.[0]?.message?.reasoning ||
-    response.result?.choices?.[0]?.message?.reasoning_content
+    response.choices?.[0]?.message?.reasoning || response.choices?.[0]?.message?.reasoning_content ||
+    response.result?.choices?.[0]?.message?.reasoning || response.result?.choices?.[0]?.message?.reasoning_content
   );
   return `keys=[${keys}]${finishReason ? `, finish_reason=${finishReason}` : ''}${hasReasoning ? ', reasoning_only=true' : ''}`;
 }
@@ -147,27 +131,37 @@ function timeoutMs(value) {
   return Math.min(60000, Math.max(5000, parsed));
 }
 
+function aiError(message, kind = 'other', status = 0) {
+  const error = new Error(message);
+  error.aiKind = kind;
+  error.status = status;
+  return error;
+}
+
 async function fetchWithTimeout(url, init, ms = DEFAULT_AI_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('timeout'), timeoutMs(ms));
+  const actualMs = timeoutMs(ms);
+  const timer = setTimeout(() => controller.abort('timeout'), actualMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (error) {
     if (error?.name === 'AbortError' || controller.signal.aborted) {
-      throw new Error(`请求超时（${Math.round(timeoutMs(ms) / 1000)} 秒）`);
+      throw aiError(`请求超时（${Math.round(actualMs / 1000)} 秒）`, 'timeout');
     }
-    throw error;
+    throw aiError(error?.message || '网络请求失败', 'network');
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function callWorkersAi(env, settings, messages, options = {}) {
-  if (!env.AI) throw new Error('Workers AI binding (env.AI) not found');
+function fallbackModel(settings, env) {
+  return resolveWorkersAiModel(settings.ai_fallback_model, env.WORKERS_AI_MODEL, DEFAULT_FALLBACK_MODEL);
+}
 
-  // 正常使用 Workers AI 时可沿用后台模型；作为 GPT 的 fallback 时，不能把 GPT 模型名传给 Workers AI。
+async function callWorkersAi(env, settings, messages, options = {}) {
+  if (!env.AI) throw aiError('Workers AI binding (env.AI) not found', 'binding');
   const model = options.fallbackMode
-    ? resolveWorkersAiModel(env.WORKERS_AI_MODEL)
+    ? fallbackModel(settings, env)
     : resolveWorkersAiModel(settings.model, env.WORKERS_AI_MODEL);
 
   const input = {
@@ -175,32 +169,30 @@ async function callWorkersAi(env, settings, messages, options = {}) {
     temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
     max_completion_tokens: 4096,
   };
+  if (model.includes('/gemma-4-')) input.chat_template_kwargs = { enable_thinking: false };
 
-  if (model.includes('/gemma-4-')) {
-    input.chat_template_kwargs = { enable_thinking: false };
+  let response;
+  try {
+    response = await env.AI.run(model, input);
+  } catch (error) {
+    throw aiError(error?.message || 'Workers AI 调用失败', 'provider');
   }
-
-  const response = await env.AI.run(model, input);
   const text = extractWorkersAiText(response);
   if (!text) {
-    throw new Error(`Workers AI response did not include generated content (${describeWorkersAiResponse(response)})`);
+    throw aiError(`Workers AI response did not include generated content (${describeWorkersAiResponse(response)})`, 'empty');
   }
-
   return { text, provider: 'workers-ai', model, fallbackUsed: Boolean(options.fallbackMode) };
 }
 
-async function callOpenAi(env, settings, messages, options = {}) {
-  if (!settings.apiKey) throw new Error('OpenAI API Key 未配置');
-  if (!settings.baseUrl) throw new Error('OpenAI Base URL 未配置');
+async function callOpenAi(settings, messages, options = {}) {
+  if (!settings.apiKey) throw aiError('OpenAI API Key 未配置', 'config');
+  if (!settings.baseUrl) throw aiError('OpenAI Base URL 未配置', 'config');
 
   const url = normalizeOpenAiChatUrl(settings.baseUrl);
   const model = settings.model || 'gpt-4o-mini';
   const response = await fetchWithTimeout(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${settings.apiKey}`,
-    },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
     body: JSON.stringify({
       model,
       messages,
@@ -210,32 +202,29 @@ async function callOpenAi(env, settings, messages, options = {}) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`OpenAI API ${response.status}: ${body.slice(0, 600)}`);
+    const kind = response.status >= 500 ? '5xx' : 'http';
+    throw aiError(`OpenAI API ${response.status}: ${body.slice(0, 600)}`, kind, response.status);
   }
 
-  const data = await response.json();
+  let data;
+  try { data = await response.json(); }
+  catch { throw aiError('OpenAI API 返回了无法解析的 JSON', 'format'); }
   const text = extractOpenAiText(data);
-  if (!text) throw new Error('OpenAI response did not include generated content');
+  if (!text) throw aiError('OpenAI response did not include generated content', 'empty');
   return { text, provider: 'openai', model, fallbackUsed: false };
 }
 
 async function callGemini(settings, messages, options = {}) {
-  if (!settings.apiKey) throw new Error('Gemini API Key 未配置');
-
+  if (!settings.apiKey) throw aiError('Gemini API Key 未配置', 'config');
   const model = settings.model || 'gemini-1.5-flash';
   const systemMessage = messages.find(message => message.role === 'system')?.content || '';
-  const contents = messages
-    .filter(message => message.role !== 'system')
-    .map(message => ({
-      role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: String(message.content || '') }],
-    }));
-
+  const contents = messages.filter(message => message.role !== 'system').map(message => ({
+    role: message.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: String(message.content || '') }],
+  }));
   const payload = {
     contents,
-    generationConfig: {
-      temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
-    },
+    generationConfig: { temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15 },
   };
   if (systemMessage) payload.systemInstruction = { parts: [{ text: systemMessage }] };
 
@@ -243,59 +232,82 @@ async function callGemini(settings, messages, options = {}) {
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': settings.apiKey,
-      },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
       body: JSON.stringify(payload),
     },
     options.timeoutMs,
   );
-
   if (!response.ok) {
-    throw new Error(`Gemini API ${response.status}: ${(await response.text()).slice(0, 600)}`);
+    const body = await response.text();
+    throw aiError(`Gemini API ${response.status}: ${body.slice(0, 600)}`, response.status >= 500 ? '5xx' : 'http', response.status);
   }
-
   const data = await response.json();
   const text = data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('') || '';
-  if (!text) throw new Error('Gemini response did not include generated content');
+  if (!text) throw aiError('Gemini response did not include generated content', 'empty');
   return { text, provider: 'gemini', model, fallbackUsed: false };
 }
 
 async function callProvider(env, settings, messages, options, provider) {
   if (provider === 'workers-ai') return callWorkersAi(env, settings, messages, options);
-  if (provider === 'openai') return callOpenAi(env, settings, messages, options);
+  if (provider === 'openai') return callOpenAi(settings, messages, options);
   if (provider === 'gemini') return callGemini(settings, messages, options);
-  throw new Error(`Unsupported provider: ${provider}`);
+  throw aiError(`Unsupported provider: ${provider}`, 'config');
+}
+
+export function isFallbackEnabledFor(settings, reason) {
+  if (!settingEnabled(settings.ai_fallback_enabled, true)) return false;
+  if ((settings.ai_fallback_provider || 'workers-ai') !== 'workers-ai') return false;
+  if (reason === 'timeout' || reason === 'network') return settingEnabled(settings.ai_fallback_on_timeout, true);
+  if (reason === '5xx') return settingEnabled(settings.ai_fallback_on_5xx, true);
+  if (reason === 'empty') return settingEnabled(settings.ai_fallback_on_empty, true);
+  if (reason === 'format') return settingEnabled(settings.ai_fallback_on_format, true);
+  return false;
 }
 
 export async function callAssistantAiWithMeta(env, settings, messages, options = {}) {
   const primaryProvider = options.forceProvider || settings.provider || 'workers-ai';
-  const allowFallback = options.allowFallback !== false && !options.forceProvider;
+
+  if (options.forceFallback) {
+    if (!isFallbackEnabledFor(settings, options.fallbackReason || 'format')) {
+      throw aiError('备用模型未启用或当前故障类型未允许切换', 'fallback-disabled');
+    }
+    const fallback = await callWorkersAi(env, settings, messages, { ...options, fallbackMode: true });
+    return {
+      ...fallback,
+      fallbackUsed: true,
+      fallbackFrom: settings.provider || 'workers-ai',
+      fallbackReason: options.fallbackReason || 'manual',
+    };
+  }
 
   try {
     return await callProvider(env, settings, messages, options, primaryProvider);
   } catch (primaryError) {
-    // GPT/中转站或 Gemini 故障时，自动回退到 Cloudflare Workers AI。
-    // Workers AI 是部署级绑定，不依赖外部中转站，可作为稳定兜底。
-    if (allowFallback && primaryProvider !== 'workers-ai' && env.AI) {
+    const reason = primaryError.aiKind || 'other';
+    const allowFallback = options.allowFallback !== false
+      && !options.forceProvider
+      && primaryProvider !== 'workers-ai'
+      && env.AI
+      && isFallbackEnabledFor(settings, reason);
+
+    if (allowFallback) {
       try {
         const fallback = await callWorkersAi(env, settings, messages, { ...options, fallbackMode: true });
         return {
           ...fallback,
           fallbackUsed: true,
           fallbackFrom: primaryProvider,
+          fallbackReason: reason,
           primaryError: primaryError.message,
         };
       } catch (fallbackError) {
-        throw new Error(`主模型失败：${primaryError.message}；Workers AI 回退也失败：${fallbackError.message}`);
+        throw new Error(`主模型失败：${primaryError.message}；备用 Workers AI 也失败：${fallbackError.message}`);
       }
     }
     throw primaryError;
   }
 }
 
-// 保留旧调用签名，其他调用方仍可只取得纯文本。
 export async function callAssistantAi(env, settings, messages, options = {}) {
   const result = await callAssistantAiWithMeta(env, settings, messages, options);
   return result.text;
