@@ -4,6 +4,7 @@ const SESSION_PREFIX = 'assistant_session_';
 const MAX_PERSISTED_MESSAGES = 40;
 const BASE_RECENT_MESSAGES = 10;
 const MAX_OLDER_MEMORY_CHARS = 1600;
+const MAX_TASK_INDEX = 16;
 
 function normalizeSessionId(value) {
   const raw = String(value || '').trim();
@@ -22,6 +23,20 @@ function cleanHistory(history) {
   return (Array.isArray(history) ? history : []).map(cleanMessage).filter(Boolean);
 }
 
+function cleanTasks(tasks) {
+  return (Array.isArray(tasks) ? tasks : []).map((task, index) => ({
+    index: Number.parseInt(task?.index, 10) || index + 1,
+    turnId: String(task?.turnId || '').slice(0, 40),
+    user: String(task?.user || '').trim().slice(0, 800),
+    reply: String(task?.reply || '').trim().replace(/\s+/g, ' ').slice(0, 900),
+    resultIds: (Array.isArray(task?.resultIds) ? task.resultIds : [])
+      .map(value => Number.parseInt(value, 10))
+      .filter(value => Number.isFinite(value) && value > 0)
+      .slice(0, 60),
+    planTitle: String(task?.planTitle || '').trim().slice(0, 120),
+  })).slice(-MAX_TASK_INDEX);
+}
+
 function compactOlderMemory(history) {
   const older = history.slice(0, Math.max(0, history.length - BASE_RECENT_MESSAGES)).slice(-12);
   if (!older.length) return '';
@@ -37,6 +52,15 @@ function compactOlderMemory(history) {
     used += line.length;
   }
   return lines.join('\n');
+}
+
+function compactTaskIndex(tasks) {
+  if (!tasks.length) return '';
+  return tasks.slice(-12).map(task => {
+    const ids = task.resultIds.length ? `；结果ID=[${task.resultIds.join(',')}]` : '';
+    const plan = task.planTitle ? `；方案=${task.planTitle}` : '';
+    return `任务${task.index}${task.turnId ? `(${task.turnId})` : ''}：${task.user.slice(0, 180)}；回复摘要=${task.reply.slice(0, 260)}${ids}${plan}`;
+  }).join('\n');
 }
 
 async function loadRawSession(env, sessionId) {
@@ -69,14 +93,20 @@ function modeInstruction(mode) {
   return '【本轮模式：normal】根据用户当前指令判断是否需要工具；除非用户明确要求修改或生成变更预览，否则不要产生 actions。';
 }
 
-function buildForwardMessage(originalMessage, previousHistory, mode) {
+function buildForwardMessage(originalMessage, previousHistory, mode, tasks) {
   const original = String(originalMessage || '').trim().slice(0, 1800);
   const memory = compactOlderMemory(previousHistory);
+  const taskIndex = compactTaskIndex(tasks);
   const parts = [original, modeInstruction(mode)];
+
+  if (taskIndex) {
+    parts.push(`【本会话稳定任务索引】\n${taskIndex}\n解释序数指代时：用户说“第一个任务/第一条结果/刚才第一条结果”时，优先按这里的任务序号理解；只有明确说“匹配结果里的第一个/搜索结果第一个”时，才按最近匹配卡片排序理解。若仍有歧义，应先追问，不要擅自选择对象。`);
+  }
+
   if (memory) {
     parts.push(`【较早的同一会话记忆，仅用于理解“刚才、之前、那些、第一个”等指代；若与当前数据库状态冲突，以重新调用工具读取的数据为准】\n${memory}`);
   }
-  return parts.join('\n\n').slice(0, 2950);
+  return parts.join('\n\n').slice(0, 5200);
 }
 
 function titleFromHistory(history) {
@@ -145,9 +175,10 @@ export async function onRequestPost(context) {
   const mode = detectRequestMode(originalMessage);
   const before = await loadRawSession(env, sessionId);
   const previousHistory = cleanHistory(before?.history).slice(-MAX_PERSISTED_MESSAGES);
+  const previousTasks = cleanTasks(before?.tasks);
   const forwardedBody = {
     ...body,
-    message: buildForwardMessage(originalMessage, previousHistory, mode),
+    message: buildForwardMessage(originalMessage, previousHistory, mode, previousTasks),
   };
 
   const forwardedRequest = new Request(request.url, {
@@ -172,6 +203,20 @@ export async function onRequestPost(context) {
         { role: 'assistant', content: String(responseData.data.reply).slice(0, 4000) },
       ].slice(-MAX_PERSISTED_MESSAGES);
 
+      const nextIndex = (previousTasks[previousTasks.length - 1]?.index || 0) + 1;
+      const task = {
+        index: nextIndex,
+        turnId: crypto.randomUUID().slice(0, 8),
+        user: originalMessage.slice(0, 800),
+        reply: String(responseData.data.reply).replace(/\s+/g, ' ').slice(0, 900),
+        resultIds: (Array.isArray(responseData.data.results) ? responseData.data.results : [])
+          .map(item => Number.parseInt(item?.id, 10))
+          .filter(value => Number.isFinite(value) && value > 0)
+          .slice(0, 60),
+        planTitle: String(responseData.data.plan?.title || '').slice(0, 120),
+      };
+      const tasks = [...previousTasks, task].slice(-MAX_TASK_INDEX);
+
       const now = new Date().toISOString();
       await env.NAV_AUTH.put(`${SESSION_PREFIX}${actualSessionId}`, JSON.stringify({
         ...after,
@@ -179,8 +224,12 @@ export async function onRequestPost(context) {
         createdAt: before?.createdAt || after?.createdAt || now,
         updatedAt: now,
         history: fullHistory,
+        tasks,
         pendingActions: responseData.data.actions || [],
       }), { expirationTtl: 7 * 24 * 60 * 60 });
+
+      responseData.data.taskIndex = nextIndex;
+      responseData.data.turnId = task.turnId;
     }
 
     finalResponse = rebuildResponse(response, responseData);
