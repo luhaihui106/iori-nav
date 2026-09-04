@@ -11,19 +11,47 @@ export function stripAssistantJsonFence(text) {
     .trim();
 }
 
+function tryParseJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function normalizeJsonPunctuation(text) {
+  return String(text || '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/，/g, ',')
+    .replace(/：/g, ':');
+}
+
 export function parseAssistantJson(text) {
   const clean = stripAssistantJsonFence(text);
-  try {
-    return JSON.parse(clean);
-  } catch {}
+  if (!clean) return null;
+
+  const direct = tryParseJson(clean);
+  if (direct) return direct;
 
   const firstObject = clean.indexOf('{');
   const lastObject = clean.lastIndexOf('}');
   if (firstObject >= 0 && lastObject > firstObject) {
-    try {
-      return JSON.parse(clean.slice(firstObject, lastObject + 1));
-    } catch {}
+    const objectText = clean.slice(firstObject, lastObject + 1);
+    const parsed = tryParseJson(objectText) || tryParseJson(normalizeJsonPunctuation(objectText));
+    if (parsed) return parsed;
   }
+
+  // 某些 OpenAI 兼容中转/模型会忽略“只返回 JSON”的要求，直接输出正常中文答案。
+  // 这种情况下不要把整个 Agent 任务判定为失败：将其降级为只读 final 回复，绝不生成写操作。
+  // 若模型尝试输出了损坏的 JSON（以 { 或 [ 开头），仍返回 null，让上层重试/切换备用模型。
+  if (!/^[\[{]/.test(clean)) {
+    return {
+      type: 'final',
+      reply: clean.slice(0, 6000),
+      results: [],
+      plan: null,
+      actions: [],
+      formatRecovered: true,
+    };
+  }
+
   return null;
 }
 
@@ -184,21 +212,35 @@ async function callWorkersAi(env, settings, messages, options = {}) {
   return { text, provider: 'workers-ai', model, fallbackUsed: Boolean(options.fallbackMode) };
 }
 
+async function sendOpenAiRequest(url, settings, messages, options, useJsonMode) {
+  const model = settings.model || 'gpt-4o-mini';
+  const payload = {
+    model,
+    messages,
+    temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
+  };
+  if (useJsonMode) payload.response_format = { type: 'json_object' };
+
+  return fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
+    body: JSON.stringify(payload),
+  }, options.timeoutMs);
+}
+
 async function callOpenAi(settings, messages, options = {}) {
   if (!settings.apiKey) throw aiError('OpenAI API Key 未配置', 'config');
   if (!settings.baseUrl) throw aiError('OpenAI Base URL 未配置', 'config');
 
   const url = normalizeOpenAiChatUrl(settings.baseUrl);
   const model = settings.model || 'gpt-4o-mini';
-  const response = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
-    }),
-  }, options.timeoutMs);
+
+  // Agent 默认要求结构化 JSON。优先启用 OpenAI-compatible JSON mode；
+  // 若中转站/模型不支持 response_format（常见为 400/422），自动无感重试普通请求。
+  let response = await sendOpenAiRequest(url, settings, messages, options, options.jsonMode !== false);
+  if (!response.ok && options.jsonMode !== false && (response.status === 400 || response.status === 422)) {
+    response = await sendOpenAiRequest(url, settings, messages, options, false);
+  }
 
   if (!response.ok) {
     const body = await response.text();
@@ -224,7 +266,10 @@ async function callGemini(settings, messages, options = {}) {
   }));
   const payload = {
     contents,
-    generationConfig: { temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15 },
+    generationConfig: {
+      temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
+      ...(options.jsonMode === false ? {} : { responseMimeType: 'application/json' }),
+    },
   };
   if (systemMessage) payload.systemInstruction = { parts: [{ text: systemMessage }] };
 
