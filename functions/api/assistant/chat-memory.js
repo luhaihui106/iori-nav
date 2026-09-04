@@ -88,7 +88,7 @@ function modeInstruction(mode) {
     return '【本轮安全模式：analysis_only】用户只要求分析/方案。可以读取数据库并给出建议，但最终 JSON 的 actions 必须是空数组 []，不得生成任何可执行变更。';
   }
   if (mode === 'prepare_changes') {
-    return '【本轮模式：prepare_changes】允许生成待确认 actions 作为预览，但绝不能直接执行数据库写入；必须等待用户在界面二次确认。';
+    return '【本轮模式：prepare_changes】必须生成可核对的待确认 actions 作为预览，绝不能直接执行数据库写入；如果上下文缺少书签 ID 或分类 ID，先调用工具补齐真实数据。只有确实没有任何有效变更时才允许 actions=[]，并且 reply 必须明确说明“0 项变更”及原因，不得声称已经生成预览。';
   }
   return '【本轮模式：normal】根据用户当前指令判断是否需要工具；除非用户明确要求修改或生成变更预览，否则不要产生 actions。';
 }
@@ -107,6 +107,10 @@ function buildForwardMessage(originalMessage, previousHistory, mode, tasks) {
     parts.push(`【较早的同一会话记忆，仅用于理解“刚才、之前、那些、第一个”等指代；若与当前数据库状态冲突，以重新调用工具读取的数据为准】\n${memory}`);
   }
   return parts.join('\n\n').slice(0, 5200);
+}
+
+function buildPrepareRetryMessage(originalMessage) {
+  return `${originalMessage}\n\n【prepare_changes 自动校验重试】上一轮没有产生任何通过后端校验的 actions。现在必须重新完成“变更预览”这一步：如果需要书签 ID、当前分类或目标分类 ID，请先重新调用工具读取真实数据；然后返回 final JSON，并把每项可执行修改写入 actions。不得只用自然语言声称“已生成预览”。如果经过核对确实没有任何需要修改的项目，则 actions 必须为 []，同时 reply 必须明确写“0 项变更”并说明原因。`.slice(0, 2600);
 }
 
 function titleFromHistory(history) {
@@ -147,6 +151,20 @@ function applyResponseSafety(responseData, mode) {
   return responseData;
 }
 
+function ensureTruthfulPrepareResponse(responseData) {
+  if (!responseData?.data || responseData.data.mode !== 'prepare_changes') return responseData;
+  const actions = Array.isArray(responseData.data.actions) ? responseData.data.actions : [];
+  if (actions.length) return responseData;
+
+  responseData.data.prepareChangesEmpty = true;
+  const reply = String(responseData.data.reply || '');
+  const explicitlyZero = /(0\s*项|零项|没有任何|无需修改|没有需要修改|无有效变更|没有有效变更)/.test(reply);
+  if (!explicitlyZero) {
+    responseData.data.reply = '未能生成可执行变更预览：本轮 prepare_changes 返回 0 项有效 actions。系统没有把自然语言声明当作已生成的预览。请重新读取目标范围后再试，或明确指定要移动、重命名或修改描述的书签。';
+  }
+  return responseData;
+}
+
 function rebuildResponse(originalResponse, data) {
   const headers = new Headers(originalResponse.headers);
   headers.set('Content-Type', 'application/json; charset=utf-8');
@@ -155,6 +173,19 @@ function rebuildResponse(originalResponse, data) {
     statusText: originalResponse.statusText,
     headers,
   });
+}
+
+function buildAgentRequest(request, body) {
+  return new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: JSON.stringify(body),
+  });
+}
+
+async function parseAgentResponse(response, mode) {
+  const data = await response.clone().json();
+  return applyResponseSafety(data, mode);
 }
 
 export async function onRequestPost(context) {
@@ -178,21 +209,41 @@ export async function onRequestPost(context) {
   const previousTasks = cleanTasks(before?.tasks);
   const forwardedBody = {
     ...body,
+    requestMode: mode,
     message: buildForwardMessage(originalMessage, previousHistory, mode, previousTasks),
   };
 
-  const forwardedRequest = new Request(request.url, {
-    method: request.method,
-    headers: request.headers,
-    body: JSON.stringify(forwardedBody),
-  });
-
-  const response = await runAgentChat({ ...context, request: forwardedRequest });
+  let response = await runAgentChat({ ...context, request: buildAgentRequest(request, forwardedBody) });
   let finalResponse = response;
 
   try {
-    let responseData = await response.clone().json();
-    responseData = applyResponseSafety(responseData, mode);
+    let responseData = await parseAgentResponse(response, mode);
+    let prepareRetryUsed = false;
+
+    if (
+      mode === 'prepare_changes' &&
+      response.ok &&
+      responseData?.code === 200 &&
+      Array.isArray(responseData?.data?.actions) &&
+      responseData.data.actions.length === 0
+    ) {
+      prepareRetryUsed = true;
+      const retryBody = {
+        ...body,
+        requestMode: mode,
+        message: buildForwardMessage(buildPrepareRetryMessage(originalMessage), previousHistory, mode, previousTasks),
+      };
+      const retryResponse = await runAgentChat({ ...context, request: buildAgentRequest(request, retryBody) });
+      if (retryResponse.ok) {
+        response = retryResponse;
+        responseData = await parseAgentResponse(retryResponse, mode);
+      }
+    }
+
+    if (responseData?.data) {
+      responseData.data.prepareRetryUsed = prepareRetryUsed;
+      responseData = ensureTruthfulPrepareResponse(responseData);
+    }
 
     if (response.ok && responseData?.code === 200 && responseData?.data?.reply) {
       const actualSessionId = normalizeSessionId(responseData.data.sessionId) || sessionId;
