@@ -272,6 +272,7 @@ async function runToolCalls(env, calls, trace) {
 function pushRuntime(runtimeEvents, meta) {
   if (!meta) return;
   runtimeEvents.push({
+    sequence: runtimeEvents.length + 1,
     provider: meta.provider || '',
     model: meta.model || '',
     fallbackUsed: Boolean(meta.fallbackUsed),
@@ -281,20 +282,64 @@ function pushRuntime(runtimeEvents, meta) {
   });
 }
 
+function sameModelCall(call, provider, model) {
+  if (!call || call.provider !== provider) return false;
+  if (!model) return true;
+  return call.model === model;
+}
+
+function runtimeReasonLabel(reason) {
+  const labels = {
+    timeout: '超时',
+    network: '网络错误',
+    '5xx': '服务端错误',
+    empty: '空响应',
+    format: '格式错误',
+  };
+  return labels[reason] || reason || '主模型异常';
+}
+
 function buildRuntimeSummary(settings, runtimeEvents) {
-  const last = runtimeEvents[runtimeEvents.length - 1] || {};
-  const fallback = [...runtimeEvents].reverse().find(item => item.fallbackUsed) || null;
+  const primaryProvider = settings.provider || 'workers-ai';
+  const primaryModel = settings.model || '';
+  const finalCall = runtimeEvents[runtimeEvents.length - 1] || {};
+  const fallbackEvents = runtimeEvents.filter(item => item.fallbackUsed);
+  const lastFallback = fallbackEvents[fallbackEvents.length - 1] || null;
+  const recoveredToPrimary = fallbackEvents.length > 0 && sameModelCall(finalCall, primaryProvider, primaryModel);
+  const fallbackActualProvider = lastFallback?.provider || settings.ai_fallback_provider || 'workers-ai';
+  const fallbackActualModel = lastFallback?.model || settings.ai_fallback_model || '@cf/google/gemma-4-26b-a4b-it';
+  const finalProvider = finalCall.provider || primaryProvider;
+  const finalModel = finalCall.model || primaryModel;
+  const fallbackReason = lastFallback?.fallbackReason || '';
+
+  let status;
+  if (!fallbackEvents.length) {
+    status = `主模型正常：${primaryModel || primaryProvider}；本次最终回答由 ${finalModel || finalProvider} 生成。`;
+  } else if (recoveredToPrimary) {
+    status = `主模型 ${primaryModel || primaryProvider} 过程中因${runtimeReasonLabel(fallbackReason)}触发备用模型 ${fallbackActualModel || fallbackActualProvider}，随后已恢复主模型；最终回答由 ${finalModel || finalProvider} 生成。`;
+  } else {
+    status = `主模型 ${primaryModel || primaryProvider} 因${runtimeReasonLabel(fallbackReason)}触发备用模型 ${fallbackActualModel || fallbackActualProvider}；最终回答由 ${finalModel || finalProvider} 生成。`;
+  }
+
   return {
-    primaryProvider: settings.provider || 'workers-ai',
-    primaryModel: settings.model || '',
+    primaryProvider,
+    primaryModel,
     fallbackEnabled: isFallbackEnabledFor(settings, 'timeout') || isFallbackEnabledFor(settings, '5xx') || isFallbackEnabledFor(settings, 'empty') || isFallbackEnabledFor(settings, 'format'),
     fallbackProvider: settings.ai_fallback_provider || 'workers-ai',
     fallbackModel: settings.ai_fallback_model || '@cf/google/gemma-4-26b-a4b-it',
-    actualProvider: last.provider || settings.provider || 'workers-ai',
-    actualModel: last.model || settings.model || '',
-    fallbackUsed: Boolean(fallback),
-    fallbackReason: fallback?.fallbackReason || '',
-    primaryError: fallback?.primaryError || '',
+    actualProvider: finalProvider,
+    actualModel: finalModel,
+    finalProvider,
+    finalModel,
+    fallbackUsed: fallbackEvents.length > 0,
+    fallbackCount: fallbackEvents.length,
+    fallbackReason,
+    fallbackActualProvider,
+    fallbackActualModel,
+    primaryError: lastFallback?.primaryError || '',
+    recoveredToPrimary,
+    status,
+    events: runtimeEvents.slice(-12),
   };
 }
 
@@ -393,11 +438,6 @@ export async function onRequestPost(context) {
 
     const data = await validateFinalPayload(env.NAV_DB, finalPayload);
     const runtime = buildRuntimeSummary(settings, runtimeEvents);
-    if (runtime.fallbackUsed) {
-      const reasonLabels = { timeout: '超时', network: '网络错误', '5xx': '服务端错误', empty: '空响应', format: '格式错误' };
-      const reason = reasonLabels[runtime.fallbackReason] || runtime.fallbackReason || '主模型异常';
-      data.reply = `⚠️ 主模型异常（${reason}），本次已自动切换到 ${runtime.actualModel || 'Cloudflare Workers AI'}。\n\n${data.reply}`;
-    }
 
     const nextHistory = [
       ...session.history,
