@@ -1,4 +1,4 @@
-const CODE_REVISION = 'assistant-r3-integrity-20260904';
+const CODE_REVISION = 'assistant-r4-preview-integrity-20260904';
 
 export async function onRequestGet(context) {
   const { env } = context;
