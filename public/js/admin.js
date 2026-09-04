@@ -1,10 +1,21 @@
 (function () {
-  function loadScript(src, datasetKey, readyCheck, errorLabel) {
-    if (readyCheck?.() || document.querySelector(`script[${datasetKey}]`)) return;
+  function loadScript(src, datasetKey, readyCheck, errorLabel, onload) {
+    if (readyCheck?.()) {
+      onload?.();
+      return;
+    }
+
+    const existing = document.querySelector(`script[${datasetKey}]`);
+    if (existing) {
+      if (onload) existing.addEventListener('load', onload, { once: true });
+      return;
+    }
+
     const script = document.createElement('script');
     script.src = src;
     script.async = true;
     script.setAttribute(datasetKey, 'true');
+    script.onload = () => onload?.();
     script.onerror = () => console.error(`Failed to load ${errorLabel}`);
     document.body.appendChild(script);
   }
@@ -15,6 +26,16 @@
       'data-iori-assistant',
       () => Boolean(window.IoriAdminAssistant),
       'AI assistant script'
+    );
+  }
+
+  function loadAssistantMemoryScript() {
+    loadScript(
+      '/js/admin-assistant-memory.js',
+      'data-iori-assistant-memory',
+      () => Boolean(window.IoriAssistantMemory),
+      'AI assistant memory script',
+      loadAssistantScript
     );
   }
 
@@ -37,7 +58,7 @@
       ?.catch?.(err => console.error('Failed to load categories:', err));
 
     loadFallbackSettingsScript();
-    loadAssistantScript();
+    loadAssistantMemoryScript();
   }
 
   initAdminPage();
