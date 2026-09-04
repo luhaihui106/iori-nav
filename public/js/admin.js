@@ -38,13 +38,23 @@
     );
   }
 
+  function loadAssistantWindowStateScript() {
+    loadScript(
+      '/js/admin-assistant-window-state.js',
+      'data-iori-assistant-window-state',
+      () => Boolean(window.IoriAssistantWindowStateFix),
+      'AI assistant window state fixes',
+      loadQualityFixesScript
+    );
+  }
+
   function loadAssistantWindowScript() {
     loadScript(
       '/js/admin-assistant-window.js',
       'data-iori-assistant-window',
       () => Boolean(window.IoriAssistantWindow),
       'AI assistant window enhancement',
-      loadQualityFixesScript
+      loadAssistantWindowStateScript
     );
   }
 
