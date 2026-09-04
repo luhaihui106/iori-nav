@@ -20,6 +20,15 @@
     document.body.appendChild(script);
   }
 
+  function loadBuildInfoScript() {
+    loadScript(
+      '/js/admin-build-info.js',
+      'data-iori-build-info',
+      () => Boolean(window.IoriBuildInfo),
+      'admin build info'
+    );
+  }
+
   function loadQualityFixesScript() {
     loadScript(
       '/js/admin-quality-fixes.js',
@@ -77,6 +86,7 @@
     window.loadGlobalCategories?.()
       ?.catch?.(err => console.error('Failed to load categories:', err));
 
+    loadBuildInfoScript();
     loadFallbackSettingsScript();
     loadAssistantMemoryScript();
   }
