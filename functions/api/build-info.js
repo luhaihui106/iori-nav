@@ -1,4 +1,4 @@
-const CODE_REVISION = 'assistant-r7-security-closure-20260904';
+const CODE_REVISION = 'assistant-r8-internal-route-closure-20260904';
 
 export async function onRequestGet(context) {
   const { env } = context;
