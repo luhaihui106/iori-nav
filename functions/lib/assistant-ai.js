@@ -23,24 +23,33 @@ function normalizeJsonPunctuation(text) {
     .replace(/：/g, ':');
 }
 
+function repairJsonText(text) {
+  return normalizeJsonPunctuation(text)
+    .replace(/^\uFEFF/, '')
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+    .trim();
+}
+
+function parseJsonCandidate(text) {
+  return tryParseJson(text) || tryParseJson(repairJsonText(text));
+}
+
 export function parseAssistantJson(text) {
   const clean = stripAssistantJsonFence(text);
   if (!clean) return null;
 
-  const direct = tryParseJson(clean);
+  const direct = parseJsonCandidate(clean);
   if (direct) return direct;
 
   const firstObject = clean.indexOf('{');
   const lastObject = clean.lastIndexOf('}');
   if (firstObject >= 0 && lastObject > firstObject) {
     const objectText = clean.slice(firstObject, lastObject + 1);
-    const parsed = tryParseJson(objectText) || tryParseJson(normalizeJsonPunctuation(objectText));
+    const parsed = parseJsonCandidate(objectText);
     if (parsed) return parsed;
   }
 
-  // 某些 OpenAI 兼容中转/模型会忽略“只返回 JSON”的要求，直接输出正常中文答案。
-  // 这种情况下不要把整个 Agent 任务判定为失败：将其降级为只读 final 回复，绝不生成写操作。
-  // 若模型尝试输出了损坏的 JSON（以 { 或 [ 开头），仍返回 null，让上层重试/切换备用模型。
   if (!/^[\[{]/.test(clean)) {
     return {
       type: 'final',
@@ -214,10 +223,11 @@ async function callWorkersAi(env, settings, messages, options = {}) {
 
 async function sendOpenAiRequest(url, settings, messages, options, useJsonMode) {
   const model = settings.model || 'gpt-4o-mini';
+  const requestedTemperature = Number.isFinite(options.temperature) ? options.temperature : 0.15;
   const payload = {
     model,
     messages,
-    temperature: Number.isFinite(options.temperature) ? options.temperature : 0.15,
+    temperature: useJsonMode ? Math.min(requestedTemperature, 0.1) : requestedTemperature,
   };
   if (useJsonMode) payload.response_format = { type: 'json_object' };
 
@@ -235,10 +245,8 @@ async function callOpenAi(settings, messages, options = {}) {
   const url = normalizeOpenAiChatUrl(settings.baseUrl);
   const model = settings.model || 'gpt-4o-mini';
 
-  // Agent 默认要求结构化 JSON。优先启用 OpenAI-compatible JSON mode；
-  // 若中转站/模型不支持 response_format（常见为 400/422），自动无感重试普通请求。
   let response = await sendOpenAiRequest(url, settings, messages, options, options.jsonMode !== false);
-  if (!response.ok && options.jsonMode !== false && (response.status === 400 || response.status === 422)) {
+  if (!response.ok && options.jsonMode !== false && (response.status === 400 || response.status === 404 || response.status === 415 || response.status === 422)) {
     response = await sendOpenAiRequest(url, settings, messages, options, false);
   }
 
