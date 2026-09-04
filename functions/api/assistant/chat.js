@@ -1,6 +1,11 @@
 import { isAdminAuthenticated, errorResponse, jsonResponse } from '../../_middleware';
 import { normalizeBookmarkName, normalizeBookmarkDesc, normalizeCategoryName } from '../../lib/validators';
-import { callAssistantAi, loadAssistantAiSettings, parseAssistantJson } from '../../lib/assistant-ai';
+import {
+  callAssistantAiWithMeta,
+  isFallbackEnabledFor,
+  loadAssistantAiSettings,
+  parseAssistantJson,
+} from '../../lib/assistant-ai';
 import { ASSISTANT_TOOL_GUIDE, executeAssistantTool } from '../../lib/assistant-tools';
 
 const SESSION_TTL = 7 * 24 * 60 * 60;
@@ -249,7 +254,6 @@ function summarizeToolResult(name, result) {
 async function runToolCalls(env, calls, trace) {
   const safeCalls = (Array.isArray(calls) ? calls : []).slice(0, MAX_TOOL_CALLS_PER_ROUND);
   const results = [];
-
   for (const call of safeCalls) {
     const name = normalizeText(call?.name, 80);
     const args = call?.arguments && typeof call.arguments === 'object' ? call.arguments : {};
@@ -262,8 +266,42 @@ async function runToolCalls(env, calls, trace) {
       trace.push(`${name} 失败：${error.message}`);
     }
   }
-
   return results;
+}
+
+function pushRuntime(runtimeEvents, meta) {
+  if (!meta) return;
+  runtimeEvents.push({
+    provider: meta.provider || '',
+    model: meta.model || '',
+    fallbackUsed: Boolean(meta.fallbackUsed),
+    fallbackFrom: meta.fallbackFrom || '',
+    fallbackReason: meta.fallbackReason || '',
+    primaryError: normalizeText(meta.primaryError, 500),
+  });
+}
+
+function buildRuntimeSummary(settings, runtimeEvents) {
+  const last = runtimeEvents[runtimeEvents.length - 1] || {};
+  const fallback = [...runtimeEvents].reverse().find(item => item.fallbackUsed) || null;
+  return {
+    primaryProvider: settings.provider || 'workers-ai',
+    primaryModel: settings.model || '',
+    fallbackEnabled: isFallbackEnabledFor(settings, 'timeout') || isFallbackEnabledFor(settings, '5xx') || isFallbackEnabledFor(settings, 'empty') || isFallbackEnabledFor(settings, 'format'),
+    fallbackProvider: settings.ai_fallback_provider || 'workers-ai',
+    fallbackModel: settings.ai_fallback_model || '@cf/google/gemma-4-26b-a4b-it',
+    actualProvider: last.provider || settings.provider || 'workers-ai',
+    actualModel: last.model || settings.model || '',
+    fallbackUsed: Boolean(fallback),
+    fallbackReason: fallback?.fallbackReason || '',
+    primaryError: fallback?.primaryError || '',
+  };
+}
+
+async function callModel(env, settings, messages, options, runtimeEvents) {
+  const result = await callAssistantAiWithMeta(env, settings, messages, options);
+  pushRuntime(runtimeEvents, result);
+  return result;
 }
 
 export async function onRequestPost(context) {
@@ -293,19 +331,33 @@ export async function onRequestPost(context) {
     ];
 
     const toolTrace = [];
+    const runtimeEvents = [];
     let finalPayload = null;
     let invalidJsonRetries = 0;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const aiText = await callAssistantAi(env, settings, messages, { temperature: 0.12 });
-      const parsed = parseAssistantJson(aiText);
+      const modelResult = await callModel(env, settings, messages, { temperature: 0.12 }, runtimeEvents);
+      let aiText = modelResult.text;
+      let parsed = parseAssistantJson(aiText);
 
       if (!parsed) {
-        if (invalidJsonRetries >= 1) throw new Error('AI 连续返回非 JSON 内容，请重试或更换模型');
-        invalidJsonRetries++;
-        messages.push({ role: 'assistant', content: normalizeText(aiText, 2500) });
-        messages.push({ role: 'user', content: '你的上一次输出不是合法 JSON。请严格按工具调用或 final JSON 格式重新输出，不要附加 Markdown。' });
-        continue;
+        if (invalidJsonRetries >= 1) {
+          if ((settings.provider || 'workers-ai') !== 'workers-ai' && env.AI && isFallbackEnabledFor(settings, 'format')) {
+            const fallbackResult = await callModel(env, settings, messages, {
+              temperature: 0.1,
+              forceFallback: true,
+              fallbackReason: 'format',
+            }, runtimeEvents);
+            aiText = fallbackResult.text;
+            parsed = parseAssistantJson(aiText);
+          }
+          if (!parsed) throw new Error('AI 连续返回非 JSON 内容，请重试或更换模型');
+        } else {
+          invalidJsonRetries++;
+          messages.push({ role: 'assistant', content: normalizeText(aiText, 2500) });
+          messages.push({ role: 'user', content: '你的上一次输出不是合法 JSON。请严格按工具调用或 final JSON 格式重新输出，不要附加 Markdown。' });
+          continue;
+        }
       }
 
       if (parsed.type === 'tool_calls') {
@@ -325,13 +377,28 @@ export async function onRequestPost(context) {
 
     if (!finalPayload) {
       messages.push({ role: 'user', content: '工具读取阶段已结束。现在不得再调用工具，请基于已获取的数据严格返回 final JSON；若没有覆盖全库，必须在 reply 和 plan.scope 中说明实际覆盖范围。' });
-      const aiText = await callAssistantAi(env, settings, messages, { temperature: 0.1 });
-      const parsed = parseAssistantJson(aiText);
+      const modelResult = await callModel(env, settings, messages, { temperature: 0.1 }, runtimeEvents);
+      let parsed = parseAssistantJson(modelResult.text);
+      if (!parsed && (settings.provider || 'workers-ai') !== 'workers-ai' && env.AI && isFallbackEnabledFor(settings, 'format')) {
+        const fallbackResult = await callModel(env, settings, messages, {
+          temperature: 0.1,
+          forceFallback: true,
+          fallbackReason: 'format',
+        }, runtimeEvents);
+        parsed = parseAssistantJson(fallbackResult.text);
+      }
       if (!parsed) throw new Error('AI 未能生成有效的最终 JSON');
       finalPayload = parsed.type === 'final' ? parsed : { ...parsed, type: 'final' };
     }
 
     const data = await validateFinalPayload(env.NAV_DB, finalPayload);
+    const runtime = buildRuntimeSummary(settings, runtimeEvents);
+    if (runtime.fallbackUsed) {
+      const reasonLabels = { timeout: '超时', network: '网络错误', '5xx': '服务端错误', empty: '空响应', format: '格式错误' };
+      const reason = reasonLabels[runtime.fallbackReason] || runtime.fallbackReason || '主模型异常';
+      data.reply = `⚠️ 主模型异常（${reason}），本次已自动切换到 ${runtime.actualModel || 'Cloudflare Workers AI'}。\n\n${data.reply}`;
+    }
+
     const nextHistory = [
       ...session.history,
       { role: 'user', content: message },
@@ -351,6 +418,7 @@ export async function onRequestPost(context) {
         sessionId,
         provider: settings.provider || 'workers-ai',
         model: settings.model || '',
+        runtime,
         reply: data.reply,
         results: data.results,
         plan: data.plan,
